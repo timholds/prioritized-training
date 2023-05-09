@@ -72,7 +72,6 @@ def prep_data(images, labels, val_per=.1, holdout_per=.3):#, test_per, holdout_p
     y_train   = labels[          :num_train]
     y_val     = labels[num_train :num_train + num_val]
     y_holdout = labels[num_train + num_val:]
-
    
     # Make sure images have shape (28, 28, 1)
     x_train    = np.expand_dims(x_train  , -1)
@@ -88,63 +87,3 @@ def prep_data(images, labels, val_per=.1, holdout_per=.3):#, test_per, holdout_p
 
     return (x_train, y_train), (x_val, y_val), (x_holdout, y_holdout)
 
-def prep_cifar_data(images):
-    pass
-
-def reload_data(images, labels, dataset='mnist', normalize=False):
-    if dataset == 'cifar':
-        (x_train, y_train), (x_test, y_test), (x_holdout, y_holdout) = load_leap_patches(images, labels, normalize=normalize)
-    else:
-        (x_train, y_train), (x_test, y_test), (x_holdout, y_holdout) = prep_mnist_data  (images, labels, num_classes=10, embed=args.tsne)
-
-
-    return (x_train, y_train), (x_test, y_test), (x_holdout, y_holdout)
-
-
-def log_util_usage():
-    print('\n *** logging utility usage ***\n')
-    mem_data = []
-    cpu_data = []
-    gpu_mem_data = []
-    while True:
-        t0 = time.time()
-        cpu_data.append(psutil.cpu_percent())
-        json_content = {"datasets": {"log_cpu_util": cpu_data},
-                        "type": "line-chart",
-                        "version": 1,
-                        "xAxisLabel": "Minute",
-                        "yAxisLabel": "Percent"}
-
-        with open('cpu_usage.json', "w+") as f:
-            json.dump(json_content, f)
-
-        mem_data.append(psutil.virtual_memory().used / (2 ** 20))
-        json_content = {"datasets": {"log_memory": mem_data},
-                        "type": "line-chart",
-                        "version": 1,
-                        "xAxisLabel": "Minute",
-                        "yAxisLabel": "Memory Used (MiB)"}
-
-        with open('cpu_memory.json', "w+") as f:
-            json.dump(json_content, f)
-
-        try:
-            nvidia_smi_proc = subprocess.Popen("nvidia-smi --query-gpu=memory.used --format=csv", stdout=subprocess.PIPE, shell=True)
-            stdout, _= nvidia_smi_proc.communicate(timeout=2)
-            gpu_mem_used = [line for line in stdout.decode().split("\n") if len(line) > 2][1:]
-            gpu_mem_used = [int(line.split(" ")[0]) for line in gpu_mem_used]
-            total_gpu_mem_used = sum(gpu_mem_used)
-            gpu_mem_data.append(total_gpu_mem_used)
-        except (UnicodeDecodeError, IndexError, ValueError):
-            gpu_mem_data.append(gpu_mem_data[-1])
-
-        json_content = {"datasets": {"log_gpu_memory": gpu_mem_data},
-                        "type": "line-chart",
-                        "version": 1,
-                        "xAxisLabel": "Minute",
-                        "yAxisLabel": "GPU Memory Used (MiB)"}
-
-        with open('gpu_memory.json', "w+") as f:
-            json.dump(json_content, f)
-
-        time.sleep(60 - (time.time() - t0))
