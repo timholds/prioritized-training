@@ -18,6 +18,7 @@ class ConvModelMNIST(keras.Model):
 		self.fc256     = layers.Dense(256, activation="relu")
 		self.fc10      = layers.Dense(10, activation="softmax")
 	
+	@tf.function
 	def call(self, inputs, training=False): 
 		x = self.c32(inputs)
 		x = self.c32_2(x)
@@ -39,8 +40,6 @@ class ConvModelMNIST(keras.Model):
 		return outputs
 
 	def train_step(self, data):
-		# Unpack the data. Its structure depends on your model and
-		# on what you pass to `fit()`.
 		x, y_true = data
 
 		with tf.GradientTape() as tape:

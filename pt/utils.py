@@ -4,10 +4,8 @@ import subprocess
 import json
 import os
 import numpy as np
-import cv2
 import tensorflow as tf
 from tensorflow import keras
-import wget
 import gzip
 import zipfile
 import pickle
@@ -44,8 +42,6 @@ def download_qmnist():
     print("Final image dataset shape:" , x.shape)
 
     return x, y
-
-
 
 def prep_data(images, labels, val_per=.1, holdout_per=.3):#, test_per, holdout_per):
     assert int(val_per + holdout_per) <= 1, 'val_per + holdout_per must be <= 1 in order to have data left for training'
