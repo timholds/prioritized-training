@@ -1,0 +1,8 @@
+archive/
+archive.zip
+MNIST-120k
+wandb/
+datasets/
+plots/
+__pycache__/
+*.png
