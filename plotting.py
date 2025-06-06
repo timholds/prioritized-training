@@ -70,15 +70,12 @@ def plot_learning_curves(result_file):
                     alpha=0.2, color='blue')
     
     ax.axhline(y=target_accuracy_pct, color='black', linestyle=':', alpha=0.7, 
-               label=f'Target ({target_accuracy_pct:.1f}%)')
+               label=f'Target Accuracy ({target_accuracy_pct:.1f}%)')
     
     ax.set_xlabel('Training Steps', fontsize=12)
     ax.set_ylabel('Test Accuracy (%)', fontsize=12)
     
-    # Convert to percentage scale
-    ax.set_ylim([75, 100])  # Focus on high accuracy range like the paper
-    
-    # Format y-axis as percentages
+    # Format y-axis as percentages (auto-scale)
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f'{y:.0f}'))
     ax.set_title(f'Learning Curves: {dataset.upper()} (subsample rate: {subsample_rate})', fontsize=14)
     ax.legend(fontsize=11)
@@ -154,7 +151,7 @@ def plot_speedup_bar_chart(result_file):
                 bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.8))
     
     ax.set_xlabel('Steps to Target Accuracy', fontsize=12)
-    ax.set_title(f'Training Efficiency: {dataset.upper()} (target: {target_accuracy:.2f})', fontsize=14)
+    ax.set_title(f'Training Efficiency: {dataset.upper()} (target: {target_accuracy:.3f}%)', fontsize=14)
     ax.grid(True, alpha=0.3, axis='x')
     
     plt.tight_layout()
@@ -265,9 +262,146 @@ def plot_summary_table(result_file):
     
     return plot_file
 
+def plot_paper_style_table(result_file):
+    """
+    Create a paper-style comparison table using LaTeX for professional formatting.
+    
+    Args:
+        result_file (str): Path to the JSON results file
+    """
+    if not os.path.exists(result_file):
+        print(f"Results file {result_file} not found.")
+        return
+    
+    with open(result_file, 'r') as f:
+        results = json.load(f)
+    
+    dataset = results['dataset']
+    target_accuracy = results['target_accuracy']
+    seeds = results['seeds']
+    steps_per_epoch = results['steps_per_epoch']
+    
+    # Calculate statistics for uniform sampling (RS) and RHO-LOSS (PT)
+    rs_final_accs = [results['rs_results'][str(seed)]['final_test_acc'] for seed in seeds]
+    pt_final_accs = [results['pt_results'][str(seed)]['final_test_acc'] for seed in seeds]
+    
+    rs_steps_to_target = [results['rs_results'][str(seed)]['steps_to_target'] 
+                         for seed in seeds if results['rs_results'][str(seed)]['steps_to_target'] is not None]
+    pt_steps_to_target = [results['pt_results'][str(seed)]['steps_to_target'] 
+                         for seed in seeds if results['pt_results'][str(seed)]['steps_to_target'] is not None]
+    
+    # Convert steps to epochs
+    rs_epochs_to_target = [int(steps / steps_per_epoch) for steps in rs_steps_to_target]
+    pt_epochs_to_target = [int(steps / steps_per_epoch) for steps in pt_steps_to_target]
+    
+    # Calculate means
+    rs_acc_mean = np.mean(rs_final_accs) * 100  # Convert to percentage
+    pt_acc_mean = np.mean(pt_final_accs) * 100  # Convert to percentage
+    rs_epochs_mean = np.mean(rs_epochs_to_target) if rs_epochs_to_target else float('inf')
+    pt_epochs_mean = np.mean(pt_epochs_to_target) if pt_epochs_to_target else float('inf')
+    
+    # Create LaTeX table
+    latex_content = rf"""
+\documentclass{{standalone}}
+\usepackage{{booktabs}}
+\usepackage{{array}}
+\begin{{document}}
+\begin{{tabular}}{{lccc}}
+\toprule
+\multicolumn{{4}}{{c}}{{\textit{{Number of epochs method needs to reach target accuracy $\downarrow$ (Final accuracy in parentheses)}}}} \\
+\midrule
+Dataset & Target Acc & Uniform Sample & RHO-LOSS \\
+\midrule
+{dataset.upper()} & {target_accuracy*100:.1f}\% & {int(rs_epochs_mean)} ({rs_acc_mean:.0f}\%) & {int(pt_epochs_mean)} ({pt_acc_mean:.0f}\%) \\
+\bottomrule
+\end{{tabular}}
+\end{{document}}
+"""
+    
+    # Write LaTeX file
+    latex_file = result_file.replace('.json', '_paper_table.tex')
+    with open(latex_file, 'w') as f:
+        f.write(latex_content)
+    
+    # Compile LaTeX to PDF then convert to PNG
+    import subprocess
+    import tempfile
+    import shutil
+    
+    try:
+        # Get directory and base name
+        base_dir = os.path.dirname(latex_file)
+        base_name = os.path.splitext(os.path.basename(latex_file))[0]
+        
+        # Compile LaTeX
+        subprocess.run(['pdflatex', '-output-directory', base_dir, latex_file], 
+                      check=True, capture_output=True)
+        
+        # Convert PDF to PNG with high DPI and white background
+        pdf_file = os.path.join(base_dir, f'{base_name}.pdf')
+        png_file = result_file.replace('.json', '_paper_table.png')
+        
+        subprocess.run(['convert', '-density', '300', '-quality', '100', 
+                       '-background', 'white', '-alpha', 'remove',
+                       pdf_file, png_file], check=True, capture_output=True)
+        
+        # Clean up auxiliary files
+        aux_extensions = ['.aux', '.log', '.pdf', '.tex']
+        for ext in aux_extensions:
+            aux_file = os.path.join(base_dir, f'{base_name}{ext}')
+            if os.path.exists(aux_file):
+                os.remove(aux_file)
+        
+        print(f"LaTeX-generated paper table saved to {png_file}")
+        return png_file
+        
+    except subprocess.CalledProcessError as e:
+        print(f"Error compiling LaTeX: {e}")
+        print("Falling back to matplotlib version...")
+        return _plot_matplotlib_table_fallback(result_file, dataset, target_accuracy, 
+                                             rs_epochs_mean, rs_acc_mean, pt_epochs_mean, pt_acc_mean)
+    except FileNotFoundError as e:
+        print(f"LaTeX or ImageMagick not found: {e}")
+        print("Falling back to matplotlib version...")
+        return _plot_matplotlib_table_fallback(result_file, dataset, target_accuracy, 
+                                             rs_epochs_mean, rs_acc_mean, pt_epochs_mean, pt_acc_mean)
+
+def _plot_matplotlib_table_fallback(result_file, dataset, target_accuracy, rs_epochs_mean, rs_acc_mean, pt_epochs_mean, pt_acc_mean):
+    """Fallback matplotlib table if LaTeX fails"""
+    fig, ax = plt.subplots(1, 1, figsize=(12, 4))
+    ax.axis('tight')
+    ax.axis('off')
+    
+    table_data = [
+        ['Dataset', 'Target Acc', 'Uniform Sample', 'RHO-LOSS'],
+        [dataset.upper(), f'{target_accuracy*100:.1f}%', 
+         f'{int(rs_epochs_mean)} ({rs_acc_mean:.0f}%)', 
+         f'{int(pt_epochs_mean)} ({pt_acc_mean:.0f}%)']
+    ]
+    
+    table = ax.table(cellText=table_data[1:], colLabels=table_data[0], 
+                     cellLoc='center', loc='center')
+    
+    header_text = 'Number of epochs method needs to reach target accuracy ↓ (Final accuracy in parentheses)'
+    ax.text(0.5, 0.85, header_text, transform=ax.transAxes, ha='center', va='center',
+            fontsize=10, style='italic')
+    
+    table.auto_set_font_size(False)
+    table.set_fontsize(11)
+    table.scale(1.0, 2.0)
+    
+    plt.title('Training Efficiency Comparison', fontsize=14, fontweight='bold', pad=20)
+    plt.tight_layout()
+    
+    plot_file = result_file.replace('.json', '_paper_table.png')
+    plt.savefig(plot_file, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    return plot_file
+
 def plot_experiment_results(result_file):
     """
-    Generate all three plots for a prioritized training experiment.
+    Generate all plots for a prioritized training experiment.
     
     Args:
         result_file (str): Path to the JSON results file
@@ -277,7 +411,7 @@ def plot_experiment_results(result_file):
     """
     plot_files = []
     
-    # Generate all three plots
+    # Generate all plots
     learning_curves_file = plot_learning_curves(result_file)
     if learning_curves_file:
         plot_files.append(learning_curves_file)
@@ -289,6 +423,10 @@ def plot_experiment_results(result_file):
     summary_file = plot_summary_table(result_file)
     if summary_file:
         plot_files.append(summary_file)
+    
+    paper_table_file = plot_paper_style_table(result_file)
+    if paper_table_file:
+        plot_files.append(paper_table_file)
     
     return plot_files
 
