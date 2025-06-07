@@ -5,7 +5,7 @@ data_model_map = {}
 data_model_map['qmnist'] = {
     'model': ConvModel,  # Store class, not instance
     'loss': 'categorical_crossentropy',
-    'target_accuracy': 0.985,
+    'target_accuracy': 0.99,
     'epochs': 2,
     'holdout_epochs': 1,
     'input_shape': (28, 28, 1),
@@ -52,11 +52,36 @@ data_model_map['cinic10'] = {
     'n_classes': 10,
     'augmentation': [keras.layers.RandomCrop, keras.layers.RandomFlip(mode='horizontal')],
     'batch_size': 64,
+}
 
+data_model_map['cocoreg'] = {
+    'model': ResNet18,  # Store class, not instance
+    'holdout_model': ResNet18,  # Use same model for holdout to ensure consistency
+    'loss': 'mse',
+    'target_metric_value': 0.05,  # Target low MSE for regression
+    'epochs': 10,
+    'holdout_epochs': 5,
+    'input_shape': (224, 224, 3),
+    'metrics': [keras.metrics.MeanSquaredError(), keras.metrics.MeanAbsoluteError()],  # Regression metrics
+    'n_outputs': 4,  # 4 bbox coordinates [x, y, width, height]
+    'augmentation': [keras.layers.RandomFlip(mode='horizontal')],
+    'batch_size': 32,
+}
+
+data_model_map['cocokp'] = {
+    'model': ResNet18,  # Store class, not instance
+    'loss': 'mse',
+    'target_metric_value': 0.01,  # Target low MSE for keypoint regression
+    'epochs': 10,
+    'holdout_epochs': 5,
+    'input_shape': (224, 224, 3),
+    'metrics': [keras.metrics.MeanSquaredError(), keras.metrics.MeanAbsoluteError()],  # Regression metrics
+    'n_classes': 34,  # 17 keypoints * 2 coordinates
+    'augmentation': [keras.layers.RandomFlip(mode='horizontal')],
+    'batch_size': 32,
 }
 
 data_model_map['mpi'] = {}
 data_model_map['affectnet'] = {}
-data_model_map['coco'] = {}
 data_model_map['raf'] = {}
 

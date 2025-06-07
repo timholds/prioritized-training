@@ -133,11 +133,12 @@ class TrainingStatsCallback(keras.callbacks.Callback):
 def compute_il_losses(holdout_model, x_train, y_train, batch_size=32):
     """
     Compute importance learning (IL) losses for training data using holdout model.
+    Uses the same loss function that the holdout model was compiled with.
     
     Args:
-        holdout_model: Trained holdout model
+        holdout_model: Trained holdout model (already compiled)
         x_train: Training images
-        y_train: Training labels (one-hot encoded)
+        y_train: Training labels
         batch_size: Batch size for prediction
         
     Returns:
@@ -148,17 +149,23 @@ def compute_il_losses(holdout_model, x_train, y_train, batch_size=32):
     # Get predictions from holdout model
     predictions = holdout_model.predict(x_train, batch_size=batch_size, verbose=0)
     
-    # Compute cross-entropy loss for each sample
-    # Using categorical crossentropy: -sum(y_true * log(y_pred + epsilon))
-    epsilon = 1e-7
-    il_losses = -np.sum(y_train * np.log(predictions + epsilon), axis=1)
+    # Use the same loss function that the holdout model was compiled with
+    loss_fn = holdout_model.compiled_loss._losses[0]  # Get the actual loss function object
+    
+    # Compute losses for each sample using the compiled loss function
+    y_true_tensor = tf.convert_to_tensor(y_train, dtype=tf.float32)
+    y_pred_tensor = tf.convert_to_tensor(predictions, dtype=tf.float32)
+    
+    # Compute per-sample losses
+    il_losses = loss_fn(y_true_tensor, y_pred_tensor).numpy()
     
     # Create dictionary mapping sample index to IL loss
     il_loss_dict = {i: loss for i, loss in enumerate(il_losses)}
     
-    print(f"IL losses computed for {len(il_loss_dict)} samples")
+    loss_name = loss_fn.__class__.__name__
+    print(f"IL losses computed for {len(il_loss_dict)} samples (loss: {loss_name})")
     print(f"  Min loss: {il_losses.min():.4f}")
-    print(f"  Max loss: {il_losses.max():.4f}")
+    print(f"  Max loss: {il_losses.max():.4f}")  
     print(f"  Mean loss: {il_losses.mean():.4f}")
     
     return il_loss_dict

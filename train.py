@@ -7,7 +7,7 @@ import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 
-from data import get_qmnist, generate_train_test_split
+from data import get_qmnist, get_cocoreg, get_cocokp, generate_train_test_split
 from data_model_map import data_model_map
 from models import compile_model
 from callbacks import PrioritizedDataGenerator, RandomDataGenerator, TrainingStatsCallback, compute_il_losses
@@ -15,14 +15,12 @@ from callbacks import PrioritizedDataGenerator, RandomDataGenerator, TrainingSta
 def parse_args():
     parser = argparse.ArgumentParser(description='Train prioritized training experiments')
     parser.add_argument('--dataset', type=str, default='qmnist', 
-                       choices=['qmnist', 'cifar10', 'cifar100', 'cinic10'],
+                       choices=['qmnist', 'cocoreg', 'cocokp'],
                        help='Dataset to use')
     parser.add_argument('--seeds', type=int, nargs='+', default=[42], 
                        help='Random seeds to use (can specify multiple)')
-    parser.add_argument('--subsample_rate', type=float, default=0.1, 
-                       help='Subsample rate (batch_size / big_batch_size)')
-    parser.add_argument('--subsample_rates', type=float, nargs='+', default=None, 
-                       help='Multiple subsample rates to test (overrides --subsample_rate)')
+    parser.add_argument('--subsample_rate', type=float, nargs='+', default=[0.1], 
+                       help='Subsample rate(s) (batch_size / big_batch_size). Can specify one or more.')
     return parser.parse_args()
 
 def get_or_train_holdout_model(dataset, config, x_holdout, y_holdout, x_val, y_val):
@@ -31,21 +29,34 @@ def get_or_train_holdout_model(dataset, config, x_holdout, y_holdout, x_val, y_v
     Holdout models are cached by dataset and holdout_epochs (reused across subsample rates).
     """
     os.makedirs('models', exist_ok=True)
-    holdout_model_path = f"models/{dataset}_holdout_{config['holdout_epochs']}epochs.h5"
+    # Include holdout model type in path to avoid conflicts
+    holdout_model_class = config.get('holdout_model', config['model'])
+    holdout_model_name = holdout_model_class.__name__
+    holdout_model_path = f"models/{dataset}_holdout_{holdout_model_name}_{config['holdout_epochs']}epochs.h5"
     
     if os.path.exists(holdout_model_path):
         print(f"Loading cached holdout model from {holdout_model_path}")
         holdout_model = keras.models.load_model(holdout_model_path)
-        holdout_test_loss, holdout_test_acc = holdout_model.evaluate(x_val, y_val, verbose=0)
-        print(f"Cached holdout model test accuracy: {holdout_test_acc:.4f}")
+        eval_results = holdout_model.evaluate(x_val, y_val, verbose=0)
+        holdout_test_loss = eval_results[0]  # Always the first value (loss)
+        holdout_test_acc = eval_results[1]   # Main metric (mse for regression, accuracy for classification)
+        print(f"Cached holdout model test metric: {holdout_test_acc:.4f}")
     else:
         print(f"Training new holdout model...")
         
-        # Create fresh holdout model
-        holdout_model = config['model'](
-            num_classes=config['n_classes'], 
-            input_shape=config['input_shape']
-        ).create_model()
+        # Create fresh holdout model - use separate holdout_model if specified
+        holdout_model_class = config.get('holdout_model', config['model'])
+        # Handle different parameter names for different models
+        if holdout_model_class.__name__ == 'ResNet18':
+            holdout_model = holdout_model_class(
+                num_outputs=config.get('n_outputs', config.get('n_classes')), 
+                input_shape=config['input_shape']
+            )
+        else:
+            holdout_model = holdout_model_class(
+                num_classes=config.get('n_classes', config.get('n_outputs')), 
+                input_shape=config['input_shape']
+            ).create_model()
         
         holdout_model = compile_model(
             holdout_model, 
@@ -63,14 +74,16 @@ def get_or_train_holdout_model(dataset, config, x_holdout, y_holdout, x_val, y_v
         )
         
         # Evaluate and save
-        holdout_test_loss, holdout_test_acc = holdout_model.evaluate(x_val, y_val, verbose=0)
-        print(f"New holdout model test accuracy: {holdout_test_acc:.4f}")
+        eval_results = holdout_model.evaluate(x_val, y_val, verbose=0)
+        holdout_test_loss = eval_results[0]
+        holdout_test_acc = eval_results[1]
+        print(f"New holdout model test metric: {holdout_test_acc:.4f}")
         
         # Save model for reuse
         holdout_model.save(holdout_model_path)
         print(f"Saved holdout model to {holdout_model_path}")
     
-    return holdout_model, holdout_test_acc
+    return holdout_model, holdout_test_acc, holdout_model_path
 
 def train_model_with_tracking(model, data_generator, x_val, y_val, 
                              config, stats_callback, epochs, train_batch_size):
@@ -94,7 +107,9 @@ def train_model_with_tracking(model, data_generator, x_val, y_val,
         def on_epoch_end(self, epoch, logs=None):
             self.current_step += self.steps_per_epoch
             # Evaluate on validation set
-            val_loss, val_acc = self.model.evaluate(self.x_val, self.y_val, verbose=0)
+            eval_results = self.model.evaluate(self.x_val, self.y_val, verbose=0)
+            val_loss = eval_results[0]
+            val_acc = eval_results[1]
             step_history['steps'].append(self.current_step)
             step_history['val_accuracy'].append(val_acc)
             step_history['val_loss'].append(val_loss)
@@ -112,15 +127,22 @@ def train_model_with_tracking(model, data_generator, x_val, y_val,
     )
     
     # Final evaluation
-    final_test_loss, final_test_acc = model.evaluate(x_val, y_val, verbose=0)
+    eval_results = model.evaluate(x_val, y_val, verbose=0)
+    final_test_loss = eval_results[0]
+    final_test_acc = eval_results[1]
     
-    # Calculate steps to target accuracy
-    target_accuracy = config['target_accuracy']
+    # Calculate steps to target metric (accuracy for classification, metric_value for regression)
+    target_metric = config.get('target_accuracy') or config.get('target_metric_value')
+    is_regression = 'target_metric_value' in config
     steps_to_target = None
     reached_target = False
     
-    for i, acc in enumerate(step_history['val_accuracy']):
-        if acc >= target_accuracy:
+    metric_values = step_history['val_loss'] if is_regression else step_history['val_accuracy']
+    
+    for i, metric_val in enumerate(metric_values):
+        # For regression, we want loss <= target_metric_value. For classification, accuracy >= target_accuracy
+        target_reached = (metric_val <= target_metric) if is_regression else (metric_val >= target_metric)
+        if target_reached:
             steps_to_target = step_history['steps'][i]
             reached_target = True
             break
@@ -135,29 +157,32 @@ def train_model_with_tracking(model, data_generator, x_val, y_val,
 def main():
     args = parse_args()
     
-    # Determine subsample rates to use
-    if args.subsample_rates is not None:
-        subsample_rates = args.subsample_rates
-    else:
-        subsample_rates = [args.subsample_rate]
+    # Always treat subsample_rate as a list
+    subsample_rates = args.subsample_rate
     
     print(f"Starting experiment with:")
     print(f"  Dataset: {args.dataset}")
     print(f"  Seeds: {args.seeds}")
     print(f"  Subsample rates: {subsample_rates}")
     
+    # Get dataset configuration
+    config = data_model_map[args.dataset]
+    
     # Load dataset (once for all seeds)
     if args.dataset == 'qmnist':
         images, labels = get_qmnist()
+    elif args.dataset == 'cocoreg':
+        images, labels = get_cocoreg()  # Load full dataset
+    elif args.dataset == 'cocokp':
+        images, labels = get_cocokp()
     else:
         raise NotImplementedError(f"Dataset {args.dataset} not implemented yet")
     
     # Split data (once for all seeds)
     # Note: This uses a fixed random state inside generate_train_test_split
-    (x_train, y_train), (x_val, y_val), (x_holdout, y_holdout) = generate_train_test_split(images, labels)
+    is_regression = 'target_metric_value' in config
+    (x_train, y_train), (x_val, y_val), (x_holdout, y_holdout) = generate_train_test_split(images, labels, is_regression=is_regression)
     
-    # Get dataset configuration
-    config = data_model_map[args.dataset]
     batch_size = config['batch_size']
     holdout_epochs = config['holdout_epochs']
     
@@ -171,7 +196,7 @@ def main():
     print("GETTING/TRAINING HOLDOUT MODEL")
     print(f"{'='*50}")
     
-    holdout_model, holdout_test_acc = get_or_train_holdout_model(
+    holdout_model, holdout_test_acc, holdout_model_path = get_or_train_holdout_model(
         args.dataset, config, x_holdout, y_holdout, x_val, y_val
     )
     
@@ -202,7 +227,8 @@ def main():
         results = {
             'dataset': args.dataset,
             'subsample_rate': subsample_rate,
-            'target_accuracy': config['target_accuracy'],
+            'target_metric': config.get('target_accuracy') or config.get('target_metric_value'),
+            'target_type': 'accuracy' if 'target_accuracy' in config else 'metric_value',
             'seeds': args.seeds,
             'batch_size': batch_size,
             'big_batch_size': big_batch_size,
@@ -210,7 +236,7 @@ def main():
             'epochs': epochs,
             'holdout_epochs': holdout_epochs,
             'holdout_test_acc': holdout_test_acc,
-            'holdout_model_path': f"models/{args.dataset}_holdout_{holdout_epochs}epochs.h5",
+            'holdout_model_path': holdout_model_path,
             'rs_results': {},
             'pt_results': {}
         }
@@ -228,10 +254,18 @@ def main():
             # Train Random Sampling (RS) model
             print(f"\nTraining Random Sampling model (seed {seed})...")
             
-            rs_model = config['model'](
-                num_classes=config['n_classes'], 
-                input_shape=config['input_shape']
-            ).create_model()
+            # Handle different parameter names for different models
+            model_class = config['model']
+            if model_class.__name__ == 'ResNet18':
+                rs_model = model_class(
+                    num_outputs=config.get('n_outputs', config.get('n_classes')), 
+                    input_shape=config['input_shape']
+                )
+            else:
+                rs_model = model_class(
+                    num_classes=config.get('n_classes', config.get('n_outputs')), 
+                    input_shape=config['input_shape']
+                ).create_model()
             
             rs_model = compile_model(
                 rs_model, 
@@ -268,10 +302,18 @@ def main():
             np.random.seed(seed)
             tf.random.set_seed(seed)
             
-            pt_model = config['model'](
-                num_classes=config['n_classes'], 
-                input_shape=config['input_shape']
-            ).create_model()
+            # Handle different parameter names for different models
+            model_class = config['model']
+            if model_class.__name__ == 'ResNet18':
+                pt_model = model_class(
+                    num_outputs=config.get('n_outputs', config.get('n_classes')), 
+                    input_shape=config['input_shape']
+                )
+            else:
+                pt_model = model_class(
+                    num_classes=config.get('n_classes', config.get('n_outputs')), 
+                    input_shape=config['input_shape']
+                ).create_model()
             
             pt_model = compile_model(
                 pt_model, 

@@ -8,6 +8,7 @@ from plotting import plot_experiment_results
 def run_experiment(dataset, seeds, subsample_rate):
     """
     Run a single experiment by calling train.py with specified parameters.
+    subsample_rate: list of float(s)
     """
     print(f"\n{'='*70}")
     print(f"Running experiment: {dataset}, subsample_rate={subsample_rate}, seeds={seeds}")
@@ -17,7 +18,8 @@ def run_experiment(dataset, seeds, subsample_rate):
     cmd = [
         sys.executable, 'train.py',
         '--dataset', dataset,
-        '--subsample_rate', str(subsample_rate),
+        '--subsample_rate'
+    ] + [str(rate) for rate in subsample_rate] + [
         '--seeds'
     ] + [str(seed) for seed in seeds]
     
@@ -35,18 +37,29 @@ def run_experiment(dataset, seeds, subsample_rate):
 
 def main():
     """
-    Stage 1: Test the complete pipeline with qmnist, 10% subsample rate, 1 seed.
-    Later stages will expand to multiple datasets, subsample rates, and seeds.
+    Run experiments on QMNIST and COCO datasets with subsample rate sweep.
     """
-    print("Starting Stage 1 experiments...")
+    print("Starting multi-dataset experiments...")
     
-    # Stage 1 configuration: single experiment to test the pipeline
+    # Multi-dataset configuration with subsample rate sweep
+    seeds = [42] #, 123, 456]  
+    subsample_rates = [0.1] #, 0.5]  
     experiments = [
+        # {
+        #     'dataset': 'qmnist',
+        #     'seeds': seeds,  
+        #     'subsample_rate': subsample_rates 
+        # },
         {
-            'dataset': 'qmnist',
-            'seeds': [42, 123, 456],  # 3 different seeds
-            'subsample_rate': 0.1
-        }
+            'dataset': 'cocoreg',
+            'seeds': seeds,
+            'subsample_rate': subsample_rates
+        },
+        # {
+        #     'dataset': 'cocokp',
+        #     'seeds': seeds,
+        #     'subsample_rate': subsample_rates
+        # }
     ]
     
     # Track success/failure
@@ -79,12 +92,13 @@ def main():
         print(f"{'='*70}")
         try:
             for exp in experiments:
-                result_file = f"results/{exp['dataset']}_subsample{exp['subsample_rate']}.json"
-                if os.path.exists(result_file):
-                    print(f"Generating plot for {result_file}...")
-                    plot_experiment_results(result_file)
-                else:
-                    print(f"Warning: Result file {result_file} not found")
+                for rate in exp['subsample_rate']:
+                    result_file = f"results/{exp['dataset']}/subsample_{rate}.json"
+                    if os.path.exists(result_file):
+                        print(f"Generating plot for {result_file}...")
+                        plot_experiment_results(result_file)
+                    else:
+                        print(f"Warning: Result file {result_file} not found")
             print("📊 All plots generated successfully!")
         except Exception as e:
             print(f"⚠️ Error generating plots: {e}")

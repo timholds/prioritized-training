@@ -1,0 +1,70 @@
+{
+  "dataset": "cocoreg",
+  "subsample_rate": 0.5,
+  "target_metric": 0.05,
+  "target_type": "metric_value",
+  "seeds": [
+    42
+  ],
+  "batch_size": 8,
+  "big_batch_size": 16,
+  "steps_per_epoch": 3,
+  "epochs": 4,
+  "holdout_epochs": 1,
+  "holdout_test_acc": 0.2776987552642822,
+  "holdout_model_path": "models/cocoreg_holdout_ConvModel_1epochs.h5",
+  "rs_results": {
+    "42": {
+      "final_test_acc": 125093.171875,
+      "steps_to_target": null,
+      "reached_target": false,
+      "history_by_step": {
+        "steps": [
+          3,
+          6,
+          9,
+          12
+        ],
+        "val_accuracy": [
+          113.48460388183594,
+          45857.38671875,
+          178455.296875,
+          125093.171875
+        ],
+        "val_loss": [
+          113.48460388183594,
+          45857.38671875,
+          178455.296875,
+          125093.171875
+        ]
+      }
+    }
+  },
+  "pt_results": {
+    "42": {
+      "final_test_acc": 190004.453125,
+      "steps_to_target": null,
+      "reached_target": false,
+      "history_by_step": {
+        "steps": [
+          3,
+          6,
+          9,
+          12
+        ],
+        "val_accuracy": [
+          111.59835052490234,
+          12035.400390625,
+          124067.140625,
+          190004.453125
+        ],
+        "val_loss": [
+          111.59835052490234,
+          12035.400390625,
+          124067.140625,
+          190004.453125
+        ]
+      }
+    }
+  }
+}

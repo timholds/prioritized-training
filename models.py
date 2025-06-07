@@ -102,21 +102,20 @@ class BasicBlock(layers.Layer):
         x = self.relu(x)
         return x
 
-class ResNet18(tf.keras.Model):
+class ResNet18Model(tf.keras.Model):
     def __init__(self, num_classes=None, input_shape=None, **kwargs):
         super().__init__(**kwargs)
         
-        # Input preprocessing
-        self.conv1 = layers.Conv2D(64, 7, strides=2, padding='same', use_bias=False)
+        # Input preprocessing (adapted for 32x32 images - no downsampling)
+        self.conv1 = layers.Conv2D(64, 3, strides=1, padding='same', use_bias=False)
         self.bn1 = layers.BatchNormalization()
         self.relu = layers.ReLU()
-        self.maxpool = layers.MaxPooling2D(3, strides=2, padding='same')
         
-        # Residual blocks
-        self.layer1 = self._make_layer(64, 2)
-        self.layer2 = self._make_layer(128, 2, stride=2)
-        self.layer3 = self._make_layer(256, 2, stride=2)
-        self.layer4 = self._make_layer(512, 2, stride=2)
+        # Residual blocks (no downsampling for 32x32 inputs)
+        self.layer1 = self._make_layer(64, 2, in_filters=64)
+        self.layer2 = self._make_layer(128, 2, stride=1, in_filters=64)
+        self.layer3 = self._make_layer(256, 2, stride=1, in_filters=128)
+        self.layer4 = self._make_layer(512, 2, stride=1, in_filters=256)
         
         # Output
         self.gap = layers.GlobalAveragePooling2D()
@@ -126,11 +125,11 @@ class ResNet18(tf.keras.Model):
         if input_shape:
             self.build((None,) + tuple(input_shape))
 
-    def _make_layer(self, filters, blocks, stride=1):
+    def _make_layer(self, filters, blocks, stride=1, in_filters=None):
         layer = tf.keras.Sequential()
-        # First block might need downsampling
-        # layer.add(BasicBlock(filters, stride, downsample=(stride != 1)))
-        layer.add(BasicBlock(filters, stride, downsample=False))
+        # First block needs downsampling if input/output filters differ or stride != 1
+        downsample_needed = (stride != 1) or (in_filters != filters)
+        layer.add(BasicBlock(filters, stride, downsample=downsample_needed))
         
         # Subsequent blocks
         for _ in range(1, blocks):
@@ -142,13 +141,75 @@ class ResNet18(tf.keras.Model):
         x = self.conv1(inputs)
         x = self.bn1(x, training=training)
         x = self.relu(x)
-        x = self.maxpool(x)
         
         x = self.layer1(x, training=training)
         x = self.layer2(x, training=training)
         x = self.layer3(x, training=training)
         x = self.layer4(x, training=training)
         
+        x = self.gap(x)
+        if self.classifier:
+            x = self.classifier(x)
+        return x
+
+    def build(self, input_shape):
+        # Initialize the model by calling it once
+        inputs = tf.keras.Input(shape=input_shape[1:])
+        _ = self.call(inputs)
+
+class ResNet18(tf.keras.Model):
+    def __init__(self, num_outputs=None, input_shape=None, output_activation=None, **kwargs):
+        """
+        Flexible ResNet18 for classification or regression.
+        Args:
+            num_outputs: Number of outputs (classes for classification, regression targets for regression)
+            input_shape: Input shape tuple
+            output_activation: Activation for output layer (e.g., 'softmax' for classification, 'linear' for regression)
+        """
+        super().__init__(**kwargs)
+        self.num_outputs = num_outputs
+        self.input_shape_ = input_shape
+        self.output_activation = output_activation
+        # Input preprocessing (adapted for 32x32 images - no downsampling)
+        self.conv1 = layers.Conv2D(64, 3, strides=1, padding='same', use_bias=False)
+        self.bn1 = layers.BatchNormalization()
+        self.relu = layers.ReLU()
+        # Residual blocks (no downsampling for 32x32 inputs)
+        self.layer1 = self._make_layer(64, 2, in_filters=64)
+        self.layer2 = self._make_layer(128, 2, stride=1, in_filters=64)
+        self.layer3 = self._make_layer(256, 2, stride=1, in_filters=128)
+        self.layer4 = self._make_layer(512, 2, stride=1, in_filters=256)
+        # Output
+        if self.num_outputs:
+            act = self.output_activation if self.output_activation is not None else 'softmax'
+            self.classifier = layers.Dense(self.num_outputs, activation=act)
+        else:
+            self.classifier = None
+        self.gap = layers.GlobalAveragePooling2D()
+        # Build the model
+        if input_shape:
+            self.build((None,) + tuple(input_shape))
+
+    def _make_layer(self, filters, blocks, stride=1, in_filters=None):
+        layer = tf.keras.Sequential()
+        # First block needs downsampling if input/output filters differ or stride != 1
+        downsample_needed = (stride != 1) or (in_filters != filters)
+        layer.add(BasicBlock(filters, stride, downsample=downsample_needed))
+        
+        # Subsequent blocks
+        for _ in range(1, blocks):
+            layer.add(BasicBlock(filters))
+        
+        return layer
+
+    def call(self, inputs, training=None):
+        x = self.conv1(inputs)
+        x = self.bn1(x, training=training)
+        x = self.relu(x)
+        x = self.layer1(x, training=training)
+        x = self.layer2(x, training=training)
+        x = self.layer3(x, training=training)
+        x = self.layer4(x, training=training)
         x = self.gap(x)
         if self.classifier:
             x = self.classifier(x)
