@@ -6,3 +6,5 @@ datasets/
 plots/
 __pycache__/
 *.png
+results/
+models/
