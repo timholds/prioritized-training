@@ -11,16 +11,17 @@ def unpickle(file):
         dict = pickle.load(fo, encoding='bytes')
     return dict
 
-def generate_train_test_split(images, labels, val_perc=0.1, holdout_perc=0.3, is_regression=False):
+def generate_train_test_split(images, labels, val_perc=0.1, holdout_perc=0.3, is_regression=False, use_paths=False):
     """
     Prepare dataset by splitting into train/val/holdout sets, normalizing, and converting to one-hot.
     
     Args:
-        images: Input image data
+        images: Input image data or image paths
         labels: Input labels
         val_perc: Fraction of data to use for validation
         holdout_perc: Fraction of data to use for holdout set
         is_regression: Whether this is a regression task (skip one-hot encoding)
+        use_paths: If True, images are file paths and won't be normalized
         
     Returns:
         (x_train, y_train), (x_val, y_val), (x_holdout, y_holdout)
@@ -28,7 +29,8 @@ def generate_train_test_split(images, labels, val_perc=0.1, holdout_perc=0.3, is
     assert val_perc + holdout_perc <= 1, 'val_perc + holdout_perc must be <= 1 in order to have data left for training'
     num_images  = images.shape[0]
 
-    images      = images.astype('float32') / 255
+    if not use_paths:
+        images = images.astype('float32') / 255
     
     if not is_regression:
         num_classes = len(set(labels.flatten()))
@@ -55,19 +57,26 @@ def generate_train_test_split(images, labels, val_perc=0.1, holdout_perc=0.3, is
     y_val     = labels[num_train :num_train + num_val]
     y_holdout = labels[num_train + num_val:]
    
-    # For MNIST-like datasets, make sure images have shape (28, 28, 1)
-    # For other datasets like COCO, keep original shape
-    if images.shape[-1] == 1 or len(images.shape) == 3:  # MNIST case
-        x_train    = np.expand_dims(x_train  , -1) if len(x_train.shape) == 3 else x_train
-        x_val      = np.expand_dims(x_val    , -1) if len(x_val.shape) == 3 else x_val
-        x_holdout  = np.expand_dims(x_holdout, -1) if len(x_holdout.shape) == 3 else x_holdout
+    if not use_paths:
+        # For MNIST-like datasets, make sure images have shape (28, 28, 1)
+        # For other datasets like COCO, keep original shape
+        if images.shape[-1] == 1 or len(images.shape) == 3:  # MNIST case
+            x_train    = np.expand_dims(x_train  , -1) if len(x_train.shape) == 3 else x_train
+            x_val      = np.expand_dims(x_val    , -1) if len(x_val.shape) == 3 else x_val
+            x_holdout  = np.expand_dims(x_holdout, -1) if len(x_holdout.shape) == 3 else x_holdout
 
     # Print shapes for verification
-    print('x_train.shape {}'.format(x_train.shape))
+    if use_paths:
+        print('x_train paths: {}'.format(len(x_train)))
+        print('x_val paths: {}'.format(len(x_val)))
+        print('x_holdout paths: {}'.format(len(x_holdout)))
+    else:
+        print('x_train.shape {}'.format(x_train.shape))
+        print('x_val.shape {}'.format(x_val.shape))
+        print('x_holdout.shape {}'.format(x_holdout.shape))
+    
     print('y_train.shape {}'.format(y_train.shape))
-    print('x_val.shape {}'.format(x_val.shape))
     print('y_val.shape {}'.format(y_val.shape))
-    print('x_holdout.shape {}'.format(x_holdout.shape))
     print('y_holdout.shape {}'.format(y_holdout.shape))
 
     return (x_train, y_train), (x_val, y_val), (x_holdout, y_holdout)
@@ -182,17 +191,16 @@ def get_cinic10():
     labels = np.array(labels).reshape(-1, 1)
     return images, labels
 
-def get_cocoreg(max_samples=None):
+def get_cocoreg_paths(max_samples=None):
     """
-    Load COCO2017 dataset from datasets/coco2017 directory for regression tasks.
-    Creates regression targets from object annotations (bounding box areas, object counts, etc.).
+    Load COCO2017 dataset paths and labels for efficient tf.data loading.
     
     Args:
         max_samples: int, maximum number of samples to load (for testing)
     
     Returns:
-        images: np.ndarray of shape (N, H, W, 3) - resized images
-        labels: np.ndarray of shape (N, 1) - regression targets (total bbox area per image)
+        image_paths: np.ndarray of shape (N,) - image file paths
+        labels: np.ndarray of shape (N, 4) - regression targets (bbox coordinates)
     """
     import json
     import glob
@@ -221,9 +229,8 @@ def get_cocoreg(max_samples=None):
             image_annotations[image_id] = []
         image_annotations[image_id].append(ann)
     
-    images = []
+    image_paths = []
     labels = []
-    target_size = (224, 224)  # Standard size for vision models
     
     print(f"Processing {len(all_images)} COCO images...")
     
@@ -249,11 +256,6 @@ def get_cocoreg(max_samples=None):
             continue
             
         try:
-            # Load and resize image
-            img = Image.open(img_path).convert('RGB')
-            img = img.resize(target_size)
-            img_array = np.array(img)
-            
             # Calculate regression target from annotations
             image_id = img_info['id']
             anns = image_annotations.get(image_id, [])
@@ -275,20 +277,21 @@ def get_cocoreg(max_samples=None):
                 bbox[3] / img_height   # height
             ]
             
-            images.append(img_array)
+            # Store path instead of loading image
+            image_paths.append(img_path)
             labels.append(normalized_bbox)
             
         except Exception as e:
             print(f"Error processing {img_path}: {e}")
             continue
     
-    images = np.array(images)
+    image_paths = np.array(image_paths, dtype=str)
     labels = np.array(labels)  # Shape: (N, 4) for bbox coordinates
     
-    print(f"Loaded {len(images)} COCO images")
+    print(f"Loaded {len(image_paths)} COCO image paths")
     print(f"Label statistics - min: {labels.min():.4f}, max: {labels.max():.4f}, mean: {labels.mean():.4f}")
     
-    return images, labels
+    return image_paths, labels
 
 def get_cocokp(max_samples=None):
     """

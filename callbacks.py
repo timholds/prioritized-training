@@ -1,6 +1,7 @@
 from tensorflow import keras
 import random
 import numpy as np
+import tensorflow as tf
 from time import time
 
 class PrioritizedDataGenerator(keras.utils.Sequence):
@@ -169,3 +170,171 @@ def compute_il_losses(holdout_model, x_train, y_train, batch_size=32):
     print(f"  Mean loss: {il_losses.mean():.4f}")
     
     return il_loss_dict
+
+
+def create_tf_data_prioritized_dataset(image_paths, labels, il_loss_dict, 
+                                     train_batch_size=32, cand_batch_size=320, 
+                                     steps_per_epoch=None, input_shape=(224, 224, 3)):
+    """
+    Create an optimized tf.data pipeline for prioritized training.
+    
+    Args:
+        image_paths: Array of image file paths
+        labels: Array of labels
+        il_loss_dict: Dictionary mapping indices to IL losses
+        train_batch_size: Final batch size for training
+        cand_batch_size: Size of candidate batch for selection
+        steps_per_epoch: Number of steps per epoch
+        input_shape: Target image shape (H, W, C)
+    
+    Returns:
+        tf.data.Dataset that yields (images, labels) batches
+    """
+    
+    # Convert IL losses to array for faster indexing
+    il_losses = np.array([il_loss_dict.get(i, 0.0) for i in range(len(image_paths))])
+    
+    def load_and_preprocess_image(path, label):
+        """Optimized image loading function"""
+        image = tf.io.read_file(path)
+        image = tf.image.decode_jpeg(image, channels=3)
+        image = tf.image.resize(image, input_shape[:2])
+        image = tf.cast(image, tf.float32) / 255.0
+        return image, label
+    
+    def sample_prioritized_batch():
+        """Sample a prioritized batch using IL losses"""
+        def py_sample_function():
+            # Sample candidate indices
+            cand_indices = np.random.choice(len(image_paths), size=cand_batch_size, replace=False)
+            
+            # Get IL losses for candidates
+            cand_losses = il_losses[cand_indices]
+            
+            # Select top-k based on highest losses
+            top_k_indices = np.argsort(cand_losses)[-train_batch_size:]
+            selected_indices = cand_indices[top_k_indices]
+            
+            return selected_indices.astype(np.int32)
+        
+        # Use tf.py_function for custom sampling logic
+        selected_indices = tf.py_function(
+            py_sample_function, 
+            [], 
+            tf.int32
+        )
+        selected_indices.set_shape([train_batch_size])
+        
+        # Gather selected paths and labels
+        selected_paths = tf.gather(image_paths, selected_indices)
+        selected_labels = tf.gather(labels, selected_indices)
+        
+        return selected_paths, selected_labels
+    
+    # Create dataset generator
+    dataset = tf.data.Dataset.from_generator(
+        lambda: iter([sample_prioritized_batch() for _ in range(steps_per_epoch or 1000)]),
+        output_signature=(
+            tf.TensorSpec(shape=(train_batch_size,), dtype=tf.string),
+            tf.TensorSpec(shape=(train_batch_size, labels.shape[1]), dtype=tf.float32)
+        )
+    )
+    
+    # Apply image loading with parallel processing
+    dataset = dataset.map(
+        lambda paths, labels: (
+            tf.map_fn(
+                lambda path: load_and_preprocess_image(path, tf.constant(0.0))[0], 
+                paths, 
+                parallel_iterations=8,
+                dtype=tf.float32
+            ),
+            labels
+        ),
+        num_parallel_calls=tf.data.AUTOTUNE
+    )
+    
+    # Add prefetching for performance
+    dataset = dataset.prefetch(tf.data.AUTOTUNE)
+    
+    return dataset
+
+
+def create_tf_data_random_dataset(image_paths, labels, train_batch_size=32, 
+                                cand_batch_size=320, steps_per_epoch=None, 
+                                input_shape=(224, 224, 3)):
+    """
+    Create an optimized tf.data pipeline for random sampling.
+    
+    Args:
+        image_paths: Array of image file paths
+        labels: Array of labels  
+        train_batch_size: Final batch size for training
+        cand_batch_size: Size of candidate batch for selection
+        steps_per_epoch: Number of steps per epoch
+        input_shape: Target image shape (H, W, C)
+    
+    Returns:
+        tf.data.Dataset that yields (images, labels) batches
+    """
+    
+    def load_and_preprocess_image(path, label):
+        """Optimized image loading function"""
+        image = tf.io.read_file(path)
+        image = tf.image.decode_jpeg(image, channels=3)
+        image = tf.image.resize(image, input_shape[:2])
+        image = tf.cast(image, tf.float32) / 255.0
+        return image, label
+    
+    def sample_random_batch():
+        """Sample a random batch"""
+        def py_sample_function():
+            # Sample candidate indices
+            cand_indices = np.random.choice(len(image_paths), size=cand_batch_size, replace=False)
+            
+            # Randomly select from candidates
+            selected_indices = np.random.choice(cand_indices, size=train_batch_size, replace=False)
+            
+            return selected_indices.astype(np.int32)
+        
+        # Use tf.py_function for custom sampling logic
+        selected_indices = tf.py_function(
+            py_sample_function, 
+            [], 
+            tf.int32
+        )
+        selected_indices.set_shape([train_batch_size])
+        
+        # Gather selected paths and labels
+        selected_paths = tf.gather(image_paths, selected_indices)
+        selected_labels = tf.gather(labels, selected_indices)
+        
+        return selected_paths, selected_labels
+    
+    # Create dataset generator
+    dataset = tf.data.Dataset.from_generator(
+        lambda: iter([sample_random_batch() for _ in range(steps_per_epoch or 1000)]),
+        output_signature=(
+            tf.TensorSpec(shape=(train_batch_size,), dtype=tf.string),
+            tf.TensorSpec(shape=(train_batch_size, labels.shape[1]), dtype=tf.float32)
+        )
+    )
+    
+    # Apply image loading with parallel processing
+    dataset = dataset.map(
+        lambda paths, labels: (
+            tf.map_fn(
+                lambda path: load_and_preprocess_image(path, tf.constant(0.0))[0], 
+                paths, 
+                parallel_iterations=8,
+                dtype=tf.float32
+            ),
+            labels
+        ),
+        num_parallel_calls=tf.data.AUTOTUNE
+    )
+    
+    # Add prefetching for performance
+    dataset = dataset.prefetch(tf.data.AUTOTUNE)
+    
+    return dataset

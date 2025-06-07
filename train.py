@@ -7,10 +7,21 @@ import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 
-from data import get_qmnist, get_cocoreg, get_cocokp, generate_train_test_split
+# Configure GPU for optimal performance
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    try:
+        # Enable memory growth to avoid allocating all GPU memory at once
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        print(f"GPU memory growth enabled for {len(gpus)} GPU(s)")
+    except RuntimeError as e:
+        print(f"GPU configuration error: {e}")
+
+from data import get_cocoreg_paths, generate_train_test_split
 from data_model_map import data_model_map
 from models import compile_model
-from callbacks import PrioritizedDataGenerator, RandomDataGenerator, TrainingStatsCallback, compute_il_losses
+from callbacks import compute_il_losses, create_tf_data_prioritized_dataset, create_tf_data_random_dataset
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train prioritized training experiments')
@@ -85,8 +96,8 @@ def get_or_train_holdout_model(dataset, config, x_holdout, y_holdout, x_val, y_v
     
     return holdout_model, holdout_test_acc, holdout_model_path
 
-def train_model_with_tracking(model, data_generator, x_val, y_val, 
-                             config, stats_callback, epochs, train_batch_size):
+def train_model_with_tracking(model, dataset, x_val, y_val, 
+                             config, steps_per_epoch, epochs, train_batch_size):
     """
     Train a model using a data generator and track step-wise progress for plotting.
     """
@@ -114,12 +125,13 @@ def train_model_with_tracking(model, data_generator, x_val, y_val,
             step_history['val_accuracy'].append(val_acc)
             step_history['val_loss'].append(val_loss)
     
-    step_tracker = StepTrackingCallback(x_val, y_val, len(data_generator))
-    callbacks = [stats_callback, step_tracker] if stats_callback else [step_tracker]
+    step_tracker = StepTrackingCallback(x_val, y_val, steps_per_epoch)
+    callbacks = [step_tracker]
     
-    # Train model using data generator
+    # Train model using tf.data dataset
     history = model.fit(
-        data_generator,
+        dataset,
+        steps_per_epoch=steps_per_epoch,
         epochs=epochs,
         validation_data=(x_val, y_val),
         callbacks=callbacks,
@@ -168,20 +180,40 @@ def main():
     # Get dataset configuration
     config = data_model_map[args.dataset]
     
-    # Load dataset (once for all seeds)
-    if args.dataset == 'qmnist':
-        images, labels = get_qmnist()
-    elif args.dataset == 'cocoreg':
-        images, labels = get_cocoreg()  # Load full dataset
-    elif args.dataset == 'cocokp':
-        images, labels = get_cocokp()
-    else:
-        raise NotImplementedError(f"Dataset {args.dataset} not implemented yet")
+    # Load COCO dataset paths for tf.data pipeline
+    if args.dataset != 'cocoreg':
+        raise NotImplementedError(f"Only cocoreg dataset supported in this optimized version")
+    
+    print(f"Loading COCO dataset paths for tf.data pipeline...")
+    image_paths, labels = get_cocoreg_paths()
     
     # Split data (once for all seeds)
-    # Note: This uses a fixed random state inside generate_train_test_split
     is_regression = 'target_metric_value' in config
-    (x_train, y_train), (x_val, y_val), (x_holdout, y_holdout) = generate_train_test_split(images, labels, is_regression=is_regression)
+    (train_paths, y_train), (val_paths, y_val), (holdout_paths, y_holdout) = generate_train_test_split(image_paths, labels, is_regression=is_regression, use_paths=True)
+    
+    # Load holdout and validation images into memory for holdout model training
+    print("Loading holdout and validation images for holdout model training...")
+    from PIL import Image
+    
+    def load_images_from_paths(paths):
+        images = []
+        target_size = config['input_shape'][:2]  # (H, W)
+        for i, path in enumerate(paths):
+            if i % 100 == 0:
+                print(f"  Loaded {i}/{len(paths)} images")
+            try:
+                img = Image.open(path).convert('RGB')
+                img = img.resize(target_size)
+                images.append(np.array(img))
+            except Exception as e:
+                print(f"Error loading {path}: {e}")
+                # Create dummy image
+                images.append(np.zeros(target_size + (3,), dtype=np.uint8))
+        return np.array(images).astype('float32') / 255.0
+    
+    x_val = load_images_from_paths(val_paths)
+    x_holdout = load_images_from_paths(holdout_paths)
+    print("Holdout and validation images loaded.")
     
     batch_size = config['batch_size']
     holdout_epochs = config['holdout_epochs']
@@ -202,6 +234,10 @@ def main():
     
     # Compute IL losses using holdout model (shared across all seeds and subsample rates)
     print(f"\nComputing IL losses...")
+    print("Loading training images for IL loss computation...")
+    x_train = load_images_from_paths(train_paths)
+    print("Training images loaded for IL loss computation.")
+    
     il_loss_dict = compute_il_losses(holdout_model, x_train, y_train, batch_size=batch_size)
     
     # Train models for each subsample rate
@@ -212,16 +248,19 @@ def main():
         
         # Calculate training parameters based on subsample rate
         big_batch_size = int(batch_size / subsample_rate)
-        steps_per_epoch = len(x_train) // big_batch_size
+        dataset_size = len(train_paths)
+        steps_per_epoch = dataset_size // big_batch_size
         epochs = int(config['epochs'] / subsample_rate)
         
         print(f"\nTraining configuration:")
+        print(f"  Dataset size: {dataset_size}")
         print(f"  Batch size: {batch_size}")
         print(f"  Big batch size: {big_batch_size}")
         print(f"  Steps per epoch: {steps_per_epoch}")
         print(f"  Holdout epochs: {holdout_epochs}")
         print(f"  Training epochs: {epochs}")
         print(f"  Subsample rate: {subsample_rate}")
+        print(f"  Using tf.data pipeline")
         
         # Initialize results structure for this subsample rate
         results = {
@@ -273,23 +312,18 @@ def main():
                 metrics=config['metrics']
             )
             
-            # Create random data generator
-            rs_generator = RandomDataGenerator(
-                x_train, y_train,
+            # Create tf.data random dataset
+            rs_dataset = create_tf_data_random_dataset(
+                train_paths, y_train,
                 train_batch_size=batch_size,
                 cand_batch_size=big_batch_size,
-                steps_per_epoch=steps_per_epoch
-            )
-            
-            rs_stats_callback = TrainingStatsCallback(
-                train_batch_size=batch_size,
-                cand_batch_size=big_batch_size,
-                training_type="Random Sampling"
+                steps_per_epoch=steps_per_epoch,
+                input_shape=config['input_shape']
             )
             
             rs_result = train_model_with_tracking(
-                rs_model, rs_generator, x_val, y_val,
-                config, rs_stats_callback, epochs, batch_size
+                rs_model, rs_dataset, x_val, y_val,
+                config, steps_per_epoch, epochs, batch_size
             )
             
             results['rs_results'][seed] = rs_result
@@ -321,24 +355,19 @@ def main():
                 metrics=config['metrics']
             )
             
-            # Create prioritized data generator
-            pt_generator = PrioritizedDataGenerator(
-                x_train, y_train,
+            # Create tf.data prioritized dataset
+            pt_dataset = create_tf_data_prioritized_dataset(
+                train_paths, y_train,
                 il_loss_dict=il_loss_dict,
                 train_batch_size=batch_size,
                 cand_batch_size=big_batch_size,
-                steps_per_epoch=steps_per_epoch
-            )
-            
-            pt_stats_callback = TrainingStatsCallback(
-                train_batch_size=batch_size,
-                cand_batch_size=big_batch_size,
-                training_type="Prioritized Training"
+                steps_per_epoch=steps_per_epoch,
+                input_shape=config['input_shape']
             )
             
             pt_result = train_model_with_tracking(
-                pt_model, pt_generator, x_val, y_val,
-                config, pt_stats_callback, epochs, batch_size
+                pt_model, pt_dataset, x_val, y_val,
+                config, steps_per_epoch, epochs, batch_size
             )
             
             results['pt_results'][seed] = pt_result
