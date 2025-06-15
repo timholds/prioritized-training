@@ -18,7 +18,7 @@ if gpus:
     except RuntimeError as e:
         print(f"GPU configuration error: {e}")
 
-from data import get_cocoreg_paths, generate_train_test_split
+from data import get_cocoreg_paths, get_cocokp_paths, generate_train_test_split
 from data_model_map import data_model_map
 from models import compile_model
 from callbacks import compute_il_losses, create_tf_data_prioritized_dataset, create_tf_data_random_dataset
@@ -180,12 +180,15 @@ def main():
     # Get dataset configuration
     config = data_model_map[args.dataset]
     
-    # Load COCO dataset paths for tf.data pipeline
-    if args.dataset != 'cocoreg':
-        raise NotImplementedError(f"Only cocoreg dataset supported in this optimized version")
-    
-    print(f"Loading COCO dataset paths for tf.data pipeline...")
-    image_paths, labels = get_cocoreg_paths()
+    # Load dataset paths for tf.data pipeline
+    if args.dataset == 'cocoreg':
+        print(f"Loading COCO regression dataset paths for tf.data pipeline...")
+        image_paths, labels = get_cocoreg_paths()
+    elif args.dataset == 'cocokp':
+        print(f"Loading COCO keypoint dataset paths for tf.data pipeline...")
+        image_paths, labels = get_cocokp_paths()
+    else:
+        raise NotImplementedError(f"Dataset {args.dataset} not supported in this optimized version")
     
     # Split data (once for all seeds)
     is_regression = 'target_metric_value' in config

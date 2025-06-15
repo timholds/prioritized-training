@@ -1,4 +1,4 @@
-from models import MLPModel, ConvModel, ResNet18
+from models import MLPModel, ConvModel, ResNet18, KeypointResNet18
 from tensorflow import keras
 
 data_model_map = {}
@@ -69,14 +69,14 @@ data_model_map['cocoreg'] = {
 }
 
 data_model_map['cocokp'] = {
-    'model': ResNet18,  # Store class, not instance
+    'model': KeypointResNet18,  # Store class, not instance
     'loss': 'mse',
     'target_metric_value': 0.01,  # Target low MSE for keypoint regression
     'epochs': 10,
     'holdout_epochs': 5,
     'input_shape': (224, 224, 3),
     'metrics': [keras.metrics.MeanSquaredError(), keras.metrics.MeanAbsoluteError()],  # Regression metrics
-    'n_classes': 34,  # 17 keypoints * 2 coordinates
+    'n_outputs': 34,  # 17 keypoints * 2 coordinates
     'augmentation': [keras.layers.RandomFlip(mode='horizontal')],
     'batch_size': 32,
 }

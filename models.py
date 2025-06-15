@@ -235,6 +235,80 @@ class ResNet18(tf.keras.Model):
 # model = compile_model(model_uncompiled, loss=loss)
 
 
+class KeypointResNet18(tf.keras.Model):
+    """
+    ResNet18 with 2-layer MLP head for keypoint regression.
+    Specialized for COCO keypoint detection (17 keypoints = 34 coordinates).
+    """
+    def __init__(self, num_outputs=34, input_shape=(224, 224, 3), **kwargs):
+        super().__init__(**kwargs)
+        self.num_outputs = num_outputs
+        self.input_shape_ = input_shape
+        
+        # ResNet18 backbone (adapted for larger 224x224 images with proper downsampling)
+        self.conv1 = layers.Conv2D(64, 7, strides=2, padding='same', use_bias=False)
+        self.bn1 = layers.BatchNormalization()
+        self.relu = layers.ReLU()
+        self.maxpool = layers.MaxPooling2D(pool_size=3, strides=2, padding='same')
+        
+        # Residual blocks with proper downsampling for 224x224 -> 7x7 feature maps
+        self.layer1 = self._make_layer(64, 2, stride=1, in_filters=64)
+        self.layer2 = self._make_layer(128, 2, stride=2, in_filters=64)
+        self.layer3 = self._make_layer(256, 2, stride=2, in_filters=128)
+        self.layer4 = self._make_layer(512, 2, stride=2, in_filters=256)
+        
+        # Global average pooling to get 512-dim feature vector
+        self.gap = layers.GlobalAveragePooling2D()
+        
+        # 2-layer MLP head for keypoint regression
+        self.mlp_layer1 = layers.Dense(256, activation='relu')
+        self.dropout1 = layers.Dropout(0.3)
+        self.mlp_layer2 = layers.Dense(self.num_outputs, activation='linear')
+        
+        # Build the model
+        if input_shape:
+            self.build((None,) + tuple(input_shape))
+
+    def _make_layer(self, filters, blocks, stride=1, in_filters=None):
+        layer = tf.keras.Sequential()
+        # First block needs downsampling if input/output filters differ or stride != 1
+        downsample_needed = (stride != 1) or (in_filters != filters)
+        layer.add(BasicBlock(filters, stride, downsample=downsample_needed))
+        
+        # Subsequent blocks
+        for _ in range(1, blocks):
+            layer.add(BasicBlock(filters))
+        
+        return layer
+
+    def call(self, inputs, training=None):
+        # ResNet18 backbone
+        x = self.conv1(inputs)
+        x = self.bn1(x, training=training)
+        x = self.relu(x)
+        x = self.maxpool(x)
+        
+        x = self.layer1(x, training=training)
+        x = self.layer2(x, training=training)
+        x = self.layer3(x, training=training)
+        x = self.layer4(x, training=training)
+        
+        # Global average pooling
+        x = self.gap(x)
+        
+        # 2-layer MLP head
+        x = self.mlp_layer1(x)
+        x = self.dropout1(x, training=training)
+        x = self.mlp_layer2(x)
+        
+        return x
+
+    def build(self, input_shape):
+        # Initialize the model by calling it once
+        inputs = tf.keras.Input(shape=input_shape[1:])
+        _ = self.call(inputs)
+
+
 def compile_model(model, 
             loss='categorical_crossentropy', 
             learning_rate=0.001, 
