@@ -131,6 +131,66 @@ class TrainingStatsCallback(keras.callbacks.Callback):
         print(f'Took {self.training_type} Model {time() - self.start_time:.3f}s in total to train')
 
 
+def compute_il_losses_streaming(holdout_model, train_paths, y_train, config, batch_size=32):
+    """
+    Compute IL losses by loading images in batches instead of all at once.
+    """
+    print("Computing IL losses using holdout model (streaming)...")
+    
+    # Process images in batches
+    il_losses = []
+    num_batches = (len(train_paths) + batch_size - 1) // batch_size
+    
+    for i in range(num_batches):
+        if i % 10 == 0:
+            print(f"  Processing batch {i+1}/{num_batches}")
+        
+        # Load batch of images
+        start_idx = i * batch_size
+        end_idx = min(start_idx + batch_size, len(train_paths))
+        batch_paths = train_paths[start_idx:end_idx]
+        batch_labels = y_train[start_idx:end_idx]
+        
+        # Load and preprocess batch images
+        batch_images = []
+        target_size = config['input_shape'][:2]
+        for path in batch_paths:
+            try:
+                from PIL import Image
+                img = Image.open(path).convert('RGB')
+                img = img.resize(target_size)
+                batch_images.append(np.array(img))
+            except Exception as e:
+                print(f"Error loading {path}: {e}")
+                batch_images.append(np.zeros(target_size + (3,), dtype=np.uint8))
+        
+        batch_images = np.array(batch_images).astype('float32') / 255.0
+        
+        # Use original compute_il_losses logic
+        predictions = holdout_model.predict(batch_images, batch_size=len(batch_images), verbose=0)
+        
+        # Get loss function from config using Keras loss registry
+        loss_name = config['loss']
+        loss_fn = tf.keras.losses.get(loss_name)
+        # Set reduction to NONE to get per-sample losses
+        loss_fn.reduction = tf.keras.losses.Reduction.NONE
+        
+        y_true_tensor = tf.convert_to_tensor(batch_labels, dtype=tf.float32)
+        y_pred_tensor = tf.convert_to_tensor(predictions, dtype=tf.float32)
+        batch_losses = loss_fn(y_true_tensor, y_pred_tensor).numpy()
+        
+        il_losses.extend(batch_losses)
+    
+    # Create dictionary mapping sample index to IL loss
+    il_loss_dict = {i: loss for i, loss in enumerate(il_losses)}
+    
+    print(f"IL losses computed for {len(il_loss_dict)} samples (loss: {config['loss']})")
+    print(f"  Min loss: {min(il_losses):.4f}")
+    print(f"  Max loss: {max(il_losses):.4f}")
+    print(f"  Mean loss: {sum(il_losses)/len(il_losses):.4f}")
+    
+    return il_loss_dict
+
 def compute_il_losses(holdout_model, x_train, y_train, batch_size=32):
     """
     Compute importance learning (IL) losses for training data using holdout model.
@@ -174,7 +234,8 @@ def compute_il_losses(holdout_model, x_train, y_train, batch_size=32):
 
 def create_tf_data_prioritized_dataset(image_paths, labels, il_loss_dict, 
                                      train_batch_size=32, cand_batch_size=320, 
-                                     steps_per_epoch=None, input_shape=(224, 224, 3)):
+                                     steps_per_epoch=None, input_shape=(224, 224, 3),
+                                     augmentation_layers=None):
     """
     Create an optimized tf.data pipeline for prioritized training.
     
@@ -186,6 +247,7 @@ def create_tf_data_prioritized_dataset(image_paths, labels, il_loss_dict,
         cand_batch_size: Size of candidate batch for selection
         steps_per_epoch: Number of steps per epoch
         input_shape: Target image shape (H, W, C)
+        augmentation_layers: List of Keras augmentation layers to apply during training
     
     Returns:
         tf.data.Dataset that yields (images, labels) batches
@@ -202,12 +264,23 @@ def create_tf_data_prioritized_dataset(image_paths, labels, il_loss_dict,
         image = tf.cast(image, tf.float32) / 255.0
         return image, label
     
-    def sample_prioritized_batch():
-        """Sample a prioritized batch using IL losses"""
-        def py_sample_function():
-            # Sample candidate indices
-            cand_indices = np.random.choice(len(image_paths), size=cand_batch_size, replace=False)
+    def epoch_generator():
+        """Generate batches for one epoch with proper shuffling"""
+        # Create indices for all samples
+        all_indices = np.arange(len(image_paths))
+        
+        # Shuffle all indices at the start of each epoch
+        np.random.shuffle(all_indices)
+        
+        # Create candidate batches by splitting shuffled indices
+        for i in range(0, len(all_indices), cand_batch_size):
+            # Get candidate batch indices
+            cand_indices = all_indices[i:i + cand_batch_size]
             
+            # Skip if we don't have enough samples for a full candidate batch
+            if len(cand_indices) < cand_batch_size:
+                continue
+                
             # Get IL losses for candidates
             cand_losses = il_losses[cand_indices]
             
@@ -215,30 +288,20 @@ def create_tf_data_prioritized_dataset(image_paths, labels, il_loss_dict,
             top_k_indices = np.argsort(cand_losses)[-train_batch_size:]
             selected_indices = cand_indices[top_k_indices]
             
-            return selected_indices.astype(np.int32)
-        
-        # Use tf.py_function for custom sampling logic
-        selected_indices = tf.py_function(
-            py_sample_function, 
-            [], 
-            tf.int32
-        )
-        selected_indices.set_shape([train_batch_size])
-        
-        # Gather selected paths and labels
-        selected_paths = tf.gather(image_paths, selected_indices)
-        selected_labels = tf.gather(labels, selected_indices)
-        
-        return selected_paths, selected_labels
+            # Gather selected paths and labels
+            selected_paths = image_paths[selected_indices]
+            selected_labels = labels[selected_indices]
+            
+            yield selected_paths, selected_labels
     
-    # Create dataset generator
+    # Create dataset for one epoch, then repeat it
     dataset = tf.data.Dataset.from_generator(
-        lambda: iter([sample_prioritized_batch() for _ in range(steps_per_epoch or 1000)]),
+        epoch_generator,
         output_signature=(
             tf.TensorSpec(shape=(train_batch_size,), dtype=tf.string),
             tf.TensorSpec(shape=(train_batch_size, labels.shape[1]), dtype=tf.float32)
         )
-    )
+    ).repeat()  # Repeat indefinitely
     
     # Apply image loading with parallel processing
     dataset = dataset.map(
@@ -254,6 +317,17 @@ def create_tf_data_prioritized_dataset(image_paths, labels, il_loss_dict,
         num_parallel_calls=tf.data.AUTOTUNE
     )
     
+    # Apply data augmentation if specified
+    if augmentation_layers:
+        def apply_augmentation(images, labels):
+            # Apply each augmentation layer sequentially to the batch
+            augmented_images = images
+            for aug_layer in augmentation_layers:
+                augmented_images = aug_layer(augmented_images, training=True)
+            return augmented_images, labels
+        
+        dataset = dataset.map(apply_augmentation, num_parallel_calls=tf.data.AUTOTUNE)
+    
     # Add prefetching for performance
     dataset = dataset.prefetch(tf.data.AUTOTUNE)
     
@@ -262,7 +336,7 @@ def create_tf_data_prioritized_dataset(image_paths, labels, il_loss_dict,
 
 def create_tf_data_random_dataset(image_paths, labels, train_batch_size=32, 
                                 cand_batch_size=320, steps_per_epoch=None, 
-                                input_shape=(224, 224, 3)):
+                                input_shape=(224, 224, 3), augmentation_layers=None):
     """
     Create an optimized tf.data pipeline for random sampling.
     
@@ -273,6 +347,7 @@ def create_tf_data_random_dataset(image_paths, labels, train_batch_size=32,
         cand_batch_size: Size of candidate batch for selection
         steps_per_epoch: Number of steps per epoch
         input_shape: Target image shape (H, W, C)
+        augmentation_layers: List of Keras augmentation layers to apply during training
     
     Returns:
         tf.data.Dataset that yields (images, labels) batches
@@ -286,39 +361,41 @@ def create_tf_data_random_dataset(image_paths, labels, train_batch_size=32,
         image = tf.cast(image, tf.float32) / 255.0
         return image, label
     
-    def sample_random_batch():
-        """Sample a random batch"""
-        def py_sample_function():
-            # Sample candidate indices
-            cand_indices = np.random.choice(len(image_paths), size=cand_batch_size, replace=False)
+    def epoch_generator():
+        """Generate batches for one epoch with proper shuffling"""
+        # Create indices for all samples
+        all_indices = np.arange(len(image_paths))
+        
+        # Shuffle all indices at the start of each epoch
+        np.random.shuffle(all_indices)
+        
+        # Create candidate batches by splitting shuffled indices
+        for i in range(0, len(all_indices), cand_batch_size):
+            # Get candidate batch indices
+            cand_indices = all_indices[i:i + cand_batch_size]
             
-            # Randomly select from candidates
-            selected_indices = np.random.choice(cand_indices, size=train_batch_size, replace=False)
+            # Skip if we don't have enough samples for a full candidate batch
+            if len(cand_indices) < cand_batch_size:
+                continue
             
-            return selected_indices.astype(np.int32)
-        
-        # Use tf.py_function for custom sampling logic
-        selected_indices = tf.py_function(
-            py_sample_function, 
-            [], 
-            tf.int32
-        )
-        selected_indices.set_shape([train_batch_size])
-        
-        # Gather selected paths and labels
-        selected_paths = tf.gather(image_paths, selected_indices)
-        selected_labels = tf.gather(labels, selected_indices)
-        
-        return selected_paths, selected_labels
+            # Randomly select train_batch_size samples from the candidate batch
+            selected_idx = np.random.choice(len(cand_indices), size=train_batch_size, replace=False)
+            selected_indices = cand_indices[selected_idx]
+            
+            # Gather selected paths and labels
+            selected_paths = image_paths[selected_indices]
+            selected_labels = labels[selected_indices]
+            
+            yield selected_paths, selected_labels
     
-    # Create dataset generator
+    # Create dataset for one epoch, then repeat it
     dataset = tf.data.Dataset.from_generator(
-        lambda: iter([sample_random_batch() for _ in range(steps_per_epoch or 1000)]),
+        epoch_generator,
         output_signature=(
             tf.TensorSpec(shape=(train_batch_size,), dtype=tf.string),
             tf.TensorSpec(shape=(train_batch_size, labels.shape[1]), dtype=tf.float32)
         )
-    )
+    ).repeat()  # Repeat indefinitely
     
     # Apply image loading with parallel processing
     dataset = dataset.map(
@@ -333,6 +410,17 @@ def create_tf_data_random_dataset(image_paths, labels, train_batch_size=32,
         ),
         num_parallel_calls=tf.data.AUTOTUNE
     )
+    
+    # Apply data augmentation if specified
+    if augmentation_layers:
+        def apply_augmentation(images, labels):
+            # Apply each augmentation layer sequentially to the batch
+            augmented_images = images
+            for aug_layer in augmentation_layers:
+                augmented_images = aug_layer(augmented_images, training=True)
+            return augmented_images, labels
+        
+        dataset = dataset.map(apply_augmentation, num_parallel_calls=tf.data.AUTOTUNE)
     
     # Add prefetching for performance
     dataset = dataset.prefetch(tf.data.AUTOTUNE)

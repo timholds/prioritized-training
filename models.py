@@ -33,6 +33,19 @@ class MLPModel(keras.Model):
     def build(self, input_shape):
         # Build a dummy model to initialize weights
         self.create_model(input_shape[1:])
+    
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'num_classes': self.num_classes,
+            'hidden_units': self.hidden_units,
+            'input_shape': self.input_shape_
+        })
+        return config
+    
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
 
 
 class ConvModel(keras.Model):
@@ -65,6 +78,18 @@ class ConvModel(keras.Model):
     def build(self, input_shape):
         # Build a dummy model to initialize weights
         self.create_model(input_shape[1:])
+    
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'num_classes': self.num_classes,
+            'input_shape': self.input_shape_
+        })
+        return config
+    
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
 
 # from tensorflow.keras import layers, Model
 
@@ -101,10 +126,21 @@ class BasicBlock(layers.Layer):
         x = self.add([x, identity])
         x = self.relu(x)
         return x
+    
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'filters': self.conv1.filters,
+            'stride': self.conv1.strides[0],
+            'downsample': self.downsample
+        })
+        return config
 
 class ResNet18Model(tf.keras.Model):
     def __init__(self, num_classes=None, input_shape=None, **kwargs):
         super().__init__(**kwargs)
+        self.num_classes = num_classes
+        self.input_shape_ = input_shape
         
         # Input preprocessing (adapted for 32x32 images - no downsampling)
         self.conv1 = layers.Conv2D(64, 3, strides=1, padding='same', use_bias=False)
@@ -156,6 +192,18 @@ class ResNet18Model(tf.keras.Model):
         # Initialize the model by calling it once
         inputs = tf.keras.Input(shape=input_shape[1:])
         _ = self.call(inputs)
+    
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'num_classes': self.num_classes,
+            'input_shape': self.input_shape_
+        })
+        return config
+    
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
 
 class ResNet18(tf.keras.Model):
     def __init__(self, num_outputs=None, input_shape=None, output_activation=None, **kwargs):
@@ -170,15 +218,28 @@ class ResNet18(tf.keras.Model):
         self.num_outputs = num_outputs
         self.input_shape_ = input_shape
         self.output_activation = output_activation
-        # Input preprocessing (adapted for 32x32 images - no downsampling)
-        self.conv1 = layers.Conv2D(64, 3, strides=1, padding='same', use_bias=False)
-        self.bn1 = layers.BatchNormalization()
-        self.relu = layers.ReLU()
-        # Residual blocks (no downsampling for 32x32 inputs)
-        self.layer1 = self._make_layer(64, 2, in_filters=64)
-        self.layer2 = self._make_layer(128, 2, stride=1, in_filters=64)
-        self.layer3 = self._make_layer(256, 2, stride=1, in_filters=128)
-        self.layer4 = self._make_layer(512, 2, stride=1, in_filters=256)
+        # Input preprocessing - adapt for image size
+        if input_shape and input_shape[0] > 64:  # For larger images like 224x224
+            self.conv1 = layers.Conv2D(64, 7, strides=2, padding='same', use_bias=False)
+            self.bn1 = layers.BatchNormalization()
+            self.relu = layers.ReLU()
+            self.maxpool = layers.MaxPooling2D(pool_size=3, strides=2, padding='same')
+            # Residual blocks with proper downsampling
+            self.layer1 = self._make_layer(64, 2, in_filters=64)
+            self.layer2 = self._make_layer(128, 2, stride=2, in_filters=64)
+            self.layer3 = self._make_layer(256, 2, stride=2, in_filters=128) 
+            self.layer4 = self._make_layer(512, 2, stride=2, in_filters=256)
+            self.use_maxpool = True
+        else:  # For smaller images like 32x32
+            self.conv1 = layers.Conv2D(64, 3, strides=1, padding='same', use_bias=False)
+            self.bn1 = layers.BatchNormalization()
+            self.relu = layers.ReLU()
+            # Residual blocks (no downsampling for 32x32 inputs)
+            self.layer1 = self._make_layer(64, 2, in_filters=64)
+            self.layer2 = self._make_layer(128, 2, stride=1, in_filters=64)
+            self.layer3 = self._make_layer(256, 2, stride=1, in_filters=128)
+            self.layer4 = self._make_layer(512, 2, stride=1, in_filters=256)
+            self.use_maxpool = False
         # Output
         if self.num_outputs:
             act = self.output_activation if self.output_activation is not None else 'softmax'
@@ -206,6 +267,8 @@ class ResNet18(tf.keras.Model):
         x = self.conv1(inputs)
         x = self.bn1(x, training=training)
         x = self.relu(x)
+        if self.use_maxpool:
+            x = self.maxpool(x)
         x = self.layer1(x, training=training)
         x = self.layer2(x, training=training)
         x = self.layer3(x, training=training)
@@ -219,6 +282,19 @@ class ResNet18(tf.keras.Model):
         # Initialize the model by calling it once
         inputs = tf.keras.Input(shape=input_shape[1:])
         _ = self.call(inputs)
+    
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'num_outputs': self.num_outputs,
+            'input_shape': self.input_shape_,
+            'output_activation': self.output_activation
+        })
+        return config
+    
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
 
 
 # Example usage:
@@ -311,7 +387,7 @@ class KeypointResNet18(tf.keras.Model):
 
 def compile_model(model, 
             loss='categorical_crossentropy', 
-            learning_rate=0.001, 
+            learning_rate=0.0001, 
             metrics=['accuracy']):
 
     ''' Compile the model with a standard optimizer and loss function '''

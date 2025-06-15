@@ -22,7 +22,7 @@ def plot_learning_curves(result_file):
     dataset = results['dataset']
     subsample_rate = results['subsample_rate']
     seeds = results['seeds']
-    target_accuracy = results['target_accuracy']
+    target_accuracy = results.get('target_accuracy', results.get('target_metric', 0.0))
     
     # Collect all learning curves for averaging
     rs_all_steps = []
@@ -30,11 +30,15 @@ def plot_learning_curves(result_file):
     pt_all_steps = []
     pt_all_accs = []
     
+    # Determine if this is a classification or regression task
+    target_type = results.get('target_type', 'accuracy')
+    metric_name = 'val_accuracy'  # This field contains accuracy for classification, metric for regression
+    
     for seed in seeds:
         rs_steps = results['rs_results'][str(seed)]['history_by_step']['steps']
-        rs_acc = results['rs_results'][str(seed)]['history_by_step']['val_accuracy']
+        rs_acc = results['rs_results'][str(seed)]['history_by_step'][metric_name]
         pt_steps = results['pt_results'][str(seed)]['history_by_step']['steps']
-        pt_acc = results['pt_results'][str(seed)]['history_by_step']['val_accuracy']
+        pt_acc = results['pt_results'][str(seed)]['history_by_step'][metric_name]
         
         rs_all_steps.append(rs_steps)
         rs_all_accs.append(rs_acc)
@@ -53,12 +57,25 @@ def plot_learning_curves(result_file):
     # Create plot
     fig, ax = plt.subplots(1, 1, figsize=(10, 6))
     
-    # Convert to percentage scale
-    rs_acc_avg_pct = rs_acc_avg * 100
-    rs_acc_std_pct = rs_acc_std * 100
-    pt_acc_avg_pct = pt_acc_avg * 100
-    pt_acc_std_pct = pt_acc_std * 100
-    target_accuracy_pct = target_accuracy * 100
+    # Handle scaling based on task type
+    if target_type == 'metric_value':
+        # For regression, use values as-is (lower is better)
+        rs_acc_avg_pct = rs_acc_avg
+        rs_acc_std_pct = rs_acc_std
+        pt_acc_avg_pct = pt_acc_avg
+        pt_acc_std_pct = pt_acc_std
+        target_accuracy_pct = target_accuracy
+        ylabel = 'Test MSE'
+        target_label = f'Target MSE ({target_accuracy:.3f})'
+    else:
+        # For classification, convert to percentage (higher is better)
+        rs_acc_avg_pct = rs_acc_avg * 100
+        rs_acc_std_pct = rs_acc_std * 100
+        pt_acc_avg_pct = pt_acc_avg * 100
+        pt_acc_std_pct = pt_acc_std * 100
+        target_accuracy_pct = target_accuracy * 100
+        ylabel = 'Test Accuracy (%)'
+        target_label = f'Target Accuracy ({target_accuracy_pct:.1f}%)'
     
     # Plot with error bands
     ax.plot(rs_steps_avg, rs_acc_avg_pct, '--', color='orange', linewidth=2, label='Uniform Sampling')
@@ -70,13 +87,16 @@ def plot_learning_curves(result_file):
                     alpha=0.2, color='blue')
     
     ax.axhline(y=target_accuracy_pct, color='black', linestyle=':', alpha=0.7, 
-               label=f'Target Accuracy ({target_accuracy_pct:.1f}%)')
+               label=target_label)
     
     ax.set_xlabel('Training Steps', fontsize=12)
-    ax.set_ylabel('Test Accuracy (%)', fontsize=12)
+    ax.set_ylabel(ylabel, fontsize=12)
     
-    # Format y-axis as percentages (auto-scale)
-    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f'{y:.0f}'))
+    # Format y-axis based on task type
+    if target_type == 'metric_value':
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f'{y:.3f}'))
+    else:
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f'{y:.0f}'))
     ax.set_title(f'Learning Curves: {dataset.upper()} (subsample rate: {subsample_rate})', fontsize=14)
     ax.legend(fontsize=11)
     ax.grid(True, alpha=0.15, linewidth=0.7)  # lighter gridlines
@@ -117,7 +137,7 @@ def plot_speedup_bar_chart(result_file):
     dataset = results['dataset']
     subsample_rate = results['subsample_rate']
     seeds = results['seeds']
-    target_accuracy = results['target_accuracy']
+    target_accuracy = results.get('target_accuracy', results.get('target_metric', 0.0))
     
     # Collect steps to target data
     rs_steps_to_target = []
@@ -166,8 +186,15 @@ def plot_speedup_bar_chart(result_file):
                 ha='right', va='bottom', fontsize=14, fontweight='bold',
                 bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
     
-    ax.set_xlabel('Steps to Target Accuracy', fontsize=12)
-    ax.set_title(f'Training Efficiency: {dataset.upper()} (target: {target_accuracy:.3f}%)', fontsize=14)
+    # Get target type for proper labeling
+    target_type = results.get('target_type', 'accuracy')
+    
+    if target_type == 'metric_value':
+        ax.set_xlabel('Steps to Target MSE', fontsize=12)
+        ax.set_title(f'Training Efficiency: {dataset.upper()} (target: {target_accuracy:.3f})', fontsize=14)
+    else:
+        ax.set_xlabel('Steps to Target Accuracy', fontsize=12)
+        ax.set_title(f'Training Efficiency: {dataset.upper()} (target: {target_accuracy*100:.1f}%)', fontsize=14)
     ax.grid(True, alpha=0.3, axis='x')
     
     plt.tight_layout(pad=2.0)
@@ -195,7 +222,7 @@ def plot_paper_style_table(result_file):
         results = json.load(f)
     
     dataset = results['dataset']
-    target_accuracy = results['target_accuracy']
+    target_accuracy = results.get('target_accuracy', results.get('target_metric', 0.0))
     seeds = results['seeds']
     steps_per_epoch = results['steps_per_epoch']
     
@@ -213,8 +240,24 @@ def plot_paper_style_table(result_file):
     pt_epochs_to_target = [int(steps / steps_per_epoch) for steps in pt_steps_to_target]
     
     # Calculate means
-    rs_acc_mean = np.mean(rs_final_accs) * 100  # Convert to percentage
-    pt_acc_mean = np.mean(pt_final_accs) * 100  # Convert to percentage
+    # Handle metric scaling based on task type
+    target_type = results.get('target_type', 'accuracy')
+    if target_type == 'metric_value':
+        # For regression, use values as-is
+        rs_acc_mean = np.mean(rs_final_accs)
+        pt_acc_mean = np.mean(pt_final_accs)
+        target_display = f'{target_accuracy:.3f}'
+        rs_display = f'{rs_acc_mean:.3f}'
+        pt_display = f'{pt_acc_mean:.3f}'
+        metric_label = 'MSE'
+    else:
+        # For classification, convert to percentage
+        rs_acc_mean = np.mean(rs_final_accs) * 100
+        pt_acc_mean = np.mean(pt_final_accs) * 100
+        target_display = f'{target_accuracy*100:.1f}\\%'
+        rs_display = f'{rs_acc_mean:.0f}\\%'
+        pt_display = f'{pt_acc_mean:.0f}\\%'
+        metric_label = 'Acc'
     rs_epochs_mean = np.mean(rs_epochs_to_target) if rs_epochs_to_target else 999
     pt_epochs_mean = np.mean(pt_epochs_to_target) if pt_epochs_to_target else 999
     
@@ -226,11 +269,11 @@ def plot_paper_style_table(result_file):
 \begin{{document}}
 \begin{{tabular}}{{lccc}}
 \toprule
-\multicolumn{{4}}{{c}}{{\textit{{Number of epochs method needs to reach target accuracy $\downarrow$ (Final accuracy in parentheses)}}}} \\
+\multicolumn{{4}}{{c}}{{\textit{{Number of epochs method needs to reach target {metric_label} $\downarrow$ (Final {metric_label} in parentheses)}}}} \\
 \midrule
-Dataset & Target Acc & Uniform Sample & RHO-LOSS \\
+Dataset & Target {metric_label} & Uniform Sample & RHO-LOSS \\
 \midrule
-{dataset.upper()} & {target_accuracy*100:.1f}\% & {int(rs_epochs_mean)} ({rs_acc_mean:.0f}\%) & {int(pt_epochs_mean)} ({pt_acc_mean:.0f}\%) \\
+{dataset.upper()} & {target_display} & {int(rs_epochs_mean)} ({rs_display}) & {int(pt_epochs_mean)} ({pt_display}) \\
 \bottomrule
 \end{{tabular}}
 \end{{document}}
@@ -290,17 +333,33 @@ def _plot_matplotlib_table_fallback(result_file, dataset, target_accuracy, rs_ep
     ax.axis('tight')
     ax.axis('off')
     
+    # Read the result file to get target_type
+    with open(result_file, 'r') as f:
+        results = json.load(f)
+    target_type = results.get('target_type', 'accuracy')
+    
+    if target_type == 'metric_value':
+        metric_label = 'MSE'
+        target_display = f'{target_accuracy:.3f}'
+        rs_display = f'{rs_acc_mean:.3f}'
+        pt_display = f'{pt_acc_mean:.3f}'
+    else:
+        metric_label = 'Acc'
+        target_display = f'{target_accuracy*100:.1f}%'
+        rs_display = f'{rs_acc_mean:.0f}%'
+        pt_display = f'{pt_acc_mean:.0f}%'
+    
     table_data = [
-        ['Dataset', 'Target Acc', 'Uniform Sample', 'RHO-LOSS'],
-        [dataset.upper(), f'{target_accuracy*100:.4f}%', 
-         f'{int(rs_epochs_mean)} ({rs_acc_mean:.0f}%)', 
-         f'{int(pt_epochs_mean)} ({pt_acc_mean:.0f}%)']
+        ['Dataset', f'Target {metric_label}', 'Uniform Sample', 'RHO-LOSS'],
+        [dataset.upper(), target_display, 
+         f'{int(rs_epochs_mean)} ({rs_display})', 
+         f'{int(pt_epochs_mean)} ({pt_display})']
     ]
     
     table = ax.table(cellText=table_data[1:], colLabels=table_data[0], 
                      cellLoc='center', loc='center')
     
-    header_text = 'Number of epochs method needs to reach target accuracy ↓ (Final accuracy in parentheses)'
+    header_text = f'Number of epochs method needs to reach target {metric_label} ↓ (Final {metric_label} in parentheses)'
     ax.text(0.5, 0.85, header_text, transform=ax.transAxes, ha='center', va='center',
             fontsize=10, style='italic')
     

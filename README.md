@@ -1,5 +1,5 @@
 # Prioritized-Training
-Keras implementation of code from this paper https://proceedings.mlr.press/v162/mindermann22a/mindermann22a.pdf
+Reproducing code from this paper https://proceedings.mlr.press/v162/mindermann22a/mindermann22a.pdf
 
 
 # Datasets
@@ -28,28 +28,37 @@ Even though prioritized training is aimed at a scenario where data is plentiful 
 
 
 ## Regression Datasets
+- [ ] COCO detection bounding boxes
+    - 330k images at 640x480 with 80 classes (regression labels are bounding boxes)
+    - ResNet-18
+- [ ] COCO Joint keypoint 
+    - 330k images at 640x480 with 34 classes (regression labels are joint keypoints)
+    - ResNet-18 
 - [ ] MPI-INF-3DHP dataset 
     - pose dataset 1.3M frames 
 - [ ] AffectNet 
     - 450k annotated images at 256x256 with 8 classes (regression labels are valence and arousal)
 - [ ] RAF-DB 
     - 30k annotated images at 256x256 with 7 classes (regression labels are valence and arousal)
-- [ ] COCO 
-    - 330k images at 640x480 with 80 classes (regression labels are bounding boxes)
-
-# Models
-- Conv Model
-- ResNet 
-- VGG 
 
 # Metrics
+There are two metrics we care about comparing across our different datasets
+- accuracy of the taget model at the end of training for 5 epochs
+  - we expect the target model to end up with a higher accuracy than the uniform sampling model, but we will also compare the accuracy of the holdout model at the end of training
+- number of steps it took to reach some target accuracy (which will be equal to the accuracy of the uniform sampling model at the end of 5 epochs)
 
+We will want to generate plots that look like this to compare the speedup to target accuracy:
+![alt text](Mindermann22a.png)
 
-# Architecture
-Excluding the NLP datasets, they use "a 3 layer MLP for experiments on QMNIST, a ResNet-18 adapted for small images for CIFAR-10/CIFAR100/CINIC-10, and a ResNet-50 for Clothing-1M. All models for Clothing-1M are pre-trained on ImageNet (standard for this dataset (Algan & Ulusoy, 2021)) and the IL model is always a ResNet-18."
+# Models and Hyperparmeters
+- "3 Layer MLP for experiments on QMNIST"
+- Conv Model similar to LeNet for the holdout model
+- "ResNet-18 adapted for small images for CIFAR-10/CIFAR100/CINIC-10"
 
-That said, later on they on to say "In our
-default setting (Fig. 2, row 1), both the target model and IL
+They use default PyTorch hyperparameters with a 10% subsammple rate
+
+They on to say 
+> "In our default setting (Fig. 2, row 1), both the target model and IL
 model have the same architecture (ResNet-18). In rows 2
 and below, we instead used a small CNN similar to LeNet
 as the IL model (LeCun et al., 1989). It has 21x fewer
@@ -63,8 +72,6 @@ In our experiments, we will use a small CNN similar to LeNet as the IL model, an
 
 
 ------
-# TODO move some of the blog post explanation I wrote into here from 5
-the goal is to show how the  loss function and objective affect the efficacy of doing prioritized training on data points that are learnable and worth learning. our hope is that for one run on qmnist, we can show on a single plot how the null hypothesis for both regression and classification tasks perform compared  to their prioritized training counterparts. the holdout model for the  classification model should be trained with a classification loss and the holdout model for regression should have a regression loss.
 
 In the paper, they use a copy of the target model to calculate the loss on the whole potential training batch, but in practice many GPUs are now memory constrained and having a copy of the target model is less feasible. 
 
@@ -84,39 +91,14 @@ We should be training with AdamW optimizer with the PyTorch default hyperparamet
 We will train our uniform sampling model, aka the random sampling / null hypothesis model, for 5 epochs "to convergence" as they say in the paper. The accuracy of the uniform sampling model at the end of 5 epochs will be used as the benchmark against which we can judge speedups. We train our prioritized training model for 5 epochs as well. 
 
 
-There are two metrics we care about comparing across our different datasets
-- accuracy of the taget model at the end of training for 5 epochs
-  - we expect the target model to end up with a higher accuracy than the uniform sampling model, but we will also compare the accuracy of the holdout model at the end of training
-- number of steps it took to reach some target accuracy (which will be equal to the accuracy of the uniform sampling model at the end of 5 epochs)
-
-We will want to generate plots that look like this to compare the speedup to target accuracy:
-![alt text](Mindermann22a.png)
 
 We should also create a table like this one 
 
 
-Here is which target model we will use for each dataset:
-### Classification Datasets
-- QMNIST - 3 layer MLP
-- CIFAR10 - LeNet style CNN
-- CIFAR100 - LeNet style CNN
-- CINIC10 - LeNet style CNN
 
-# Regression Datasets
-- MPI-INF-3DHP dataset - ResNet-18
-- AffectNet - ResNet-18
-
-TODO later we can redo experiments with ResNet-18 as the target model and keep LeNet as the IL model. 
 
 
 While our model / loss will be different between the classification and regression tasks, we want to make sure WITHIN an experiment both the target model and the holdout model are using the same loss function and we use that same loss when calculating the RHO loss. 
-
-
-TODO gray these out since they are in the paper but we will not be experimenting on them
-~- [ ] Clothing1M - 1M images at 256x256 with 14 classes
-- [ ] FashionMNIST - 70k grayscale images at 28x28 with 10 classes
-- [ ] CoLA - NLP dataset with 10k sentences 
-- [ ] SST-2 - NLP dataset with 12k sentences~
 
 
 
