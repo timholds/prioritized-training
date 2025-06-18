@@ -57,9 +57,18 @@ def plot_learning_curves(result_file):
     # Create plot
     fig, ax = plt.subplots(1, 1, figsize=(10, 6))
     
-    # Handle scaling based on task type
-    if target_type == 'metric_value':
-        # For regression, use values as-is (lower is better)
+    # Handle scaling based on task type and dataset
+    if dataset == 'cocokp':
+        # For keypoint detection, OKS is the metric (higher is better, 0-1 scale)
+        rs_acc_avg_pct = rs_acc_avg * 100
+        rs_acc_std_pct = rs_acc_std * 100
+        pt_acc_avg_pct = pt_acc_avg * 100
+        pt_acc_std_pct = pt_acc_std * 100
+        target_accuracy_pct = target_accuracy * 100
+        ylabel = 'Test OKS (%)'
+        target_label = f'Target OKS ({target_accuracy_pct:.0f}%)'
+    elif target_type == 'metric_value':
+        # For other regression tasks, use values as-is (lower is better)
         rs_acc_avg_pct = rs_acc_avg
         rs_acc_std_pct = rs_acc_std
         pt_acc_avg_pct = pt_acc_avg
@@ -189,7 +198,10 @@ def plot_speedup_bar_chart(result_file):
     # Get target type for proper labeling
     target_type = results.get('target_type', 'accuracy')
     
-    if target_type == 'metric_value':
+    if dataset == 'cocokp':
+        ax.set_xlabel('Steps to Target OKS', fontsize=12)
+        ax.set_title(f'Training Efficiency: {dataset.upper()} (target: {target_accuracy*100:.0f}% OKS)', fontsize=14)
+    elif target_type == 'metric_value':
         ax.set_xlabel('Steps to Target MSE', fontsize=12)
         ax.set_title(f'Training Efficiency: {dataset.upper()} (target: {target_accuracy:.3f})', fontsize=14)
     else:
@@ -242,7 +254,15 @@ def plot_paper_style_table(result_file):
     # Calculate means
     # Handle metric scaling based on task type
     target_type = results.get('target_type', 'accuracy')
-    if target_type == 'metric_value':
+    if dataset == 'cocokp':
+        # For keypoint detection, OKS is a percentage
+        rs_acc_mean = np.mean(rs_final_accs) * 100
+        pt_acc_mean = np.mean(pt_final_accs) * 100
+        target_display = f'{target_accuracy*100:.0f}\\%'
+        rs_display = f'{rs_acc_mean:.0f}\\%'
+        pt_display = f'{pt_acc_mean:.0f}\\%'
+        metric_label = 'OKS'
+    elif target_type == 'metric_value':
         # For regression, use values as-is
         rs_acc_mean = np.mean(rs_final_accs)
         pt_acc_mean = np.mean(pt_final_accs)
@@ -338,7 +358,12 @@ def _plot_matplotlib_table_fallback(result_file, dataset, target_accuracy, rs_ep
         results = json.load(f)
     target_type = results.get('target_type', 'accuracy')
     
-    if target_type == 'metric_value':
+    if dataset == 'cocokp':
+        metric_label = 'OKS'
+        target_display = f'{target_accuracy*100:.0f}%'
+        rs_display = f'{rs_acc_mean:.0f}%'
+        pt_display = f'{pt_acc_mean:.0f}%'
+    elif target_type == 'metric_value':
         metric_label = 'MSE'
         target_display = f'{target_accuracy:.3f}'
         rs_display = f'{rs_acc_mean:.3f}'

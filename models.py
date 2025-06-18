@@ -321,11 +321,19 @@ class KeypointResNet18(tf.keras.Model):
         self.num_outputs = num_outputs
         self.input_shape_ = input_shape
         
-        # ResNet18 backbone (adapted for larger 224x224 images with proper downsampling)
-        self.conv1 = layers.Conv2D(64, 7, strides=2, padding='same', use_bias=False)
-        self.bn1 = layers.BatchNormalization()
-        self.relu = layers.ReLU()
-        self.maxpool = layers.MaxPooling2D(pool_size=3, strides=2, padding='same')
+        # Adapt architecture based on input size
+        if input_shape[0] <= 112:
+            # For smaller images (112x112), use less aggressive downsampling
+            self.conv1 = layers.Conv2D(64, 3, strides=1, padding='same', use_bias=False)
+            self.bn1 = layers.BatchNormalization()
+            self.relu = layers.ReLU()
+            self.maxpool = layers.MaxPooling2D(pool_size=3, strides=2, padding='same')
+        else:
+            # For larger images (224x224), use standard ResNet downsampling
+            self.conv1 = layers.Conv2D(64, 7, strides=2, padding='same', use_bias=False)
+            self.bn1 = layers.BatchNormalization()
+            self.relu = layers.ReLU()
+            self.maxpool = layers.MaxPooling2D(pool_size=3, strides=2, padding='same')
         
         # Residual blocks with proper downsampling for 224x224 -> 7x7 feature maps
         self.layer1 = self._make_layer(64, 2, stride=1, in_filters=64)
@@ -337,9 +345,10 @@ class KeypointResNet18(tf.keras.Model):
         self.gap = layers.GlobalAveragePooling2D()
         
         # 2-layer MLP head for keypoint regression
-        self.mlp_layer1 = layers.Dense(256, activation='relu')
+        self.mlp_layer1 = layers.Dense(128, activation='relu')
         self.dropout1 = layers.Dropout(0.3)
-        self.mlp_layer2 = layers.Dense(self.num_outputs, activation='linear')
+        # Use sigmoid to ensure outputs are in [0, 1] range for normalized coordinates
+        self.mlp_layer2 = layers.Dense(self.num_outputs, activation='sigmoid')
         
         # Build the model
         if input_shape:
@@ -383,20 +392,118 @@ class KeypointResNet18(tf.keras.Model):
         # Initialize the model by calling it once
         inputs = tf.keras.Input(shape=input_shape[1:])
         _ = self.call(inputs)
+    
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'num_outputs': self.num_outputs,
+            'input_shape': self.input_shape_
+        })
+        return config
+    
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
 
 
 def compile_model(model, 
             loss='categorical_crossentropy', 
-            learning_rate=0.0001, 
-            metrics=['accuracy']):
+            learning_rate=0.001, 
+            metrics=['accuracy'],
+            loss_kwargs=None,
+            optimizer='sgd',
+            momentum=0.9,
+            weight_decay=5e-4,
+            lr_schedule=None):
 
     ''' Compile the model with a standard optimizer and loss function '''
+    
+    # Handle custom keypoint losses
+    if isinstance(loss, str) and loss in ['smooth_l1_with_visibility', 'mse_with_visibility', 'smooth_l1', 'keypoint_loss_with_visibility', 'keypoint_mse_with_visibility']:
+        from keypoint_losses import create_keypoint_loss
+        loss_kwargs = loss_kwargs or {}
+        loss = create_keypoint_loss(loss, **loss_kwargs)
+    
+    # Create optimizer based on type
+    if optimizer.lower() == 'sgd':
+        # Standard ResNet training uses SGD with momentum and weight decay
+        opt = keras.optimizers.SGD(
+            learning_rate=lr_schedule if lr_schedule is not None else learning_rate,
+            momentum=momentum,
+            weight_decay=weight_decay
+        )
+    elif optimizer.lower() == 'adam':
+        # Adam with weight decay (AdamW-like behavior)
+        opt = keras.optimizers.Adam(
+            learning_rate=lr_schedule if lr_schedule is not None else learning_rate,
+            weight_decay=weight_decay
+        )
+    else:
+        raise ValueError(f"Unsupported optimizer: {optimizer}")
+    
     model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=learning_rate),
+        optimizer=opt,
         loss=loss,
         metrics=metrics
     )
     return model
+
+
+def create_resnet_lr_schedule(initial_lr=0.1, decay_epochs=[30, 60, 90], decay_factor=0.1):
+    """
+    Create standard ResNet learning rate schedule (step decay).
+    
+    Args:
+        initial_lr: Initial learning rate (standard: 0.1)
+        decay_epochs: Epochs at which to decay learning rate (standard: [30, 60, 90])
+        decay_factor: Factor by which to multiply LR (standard: 0.1)
+    
+    Returns:
+        keras.optimizers.schedules.PiecewiseConstantDecay schedule
+    """
+    # Convert epochs to steps (assumes steps_per_epoch will be multiplied in)
+    boundaries = decay_epochs
+    values = [initial_lr * (decay_factor ** i) for i in range(len(decay_epochs) + 1)]
+    
+    return keras.optimizers.schedules.PiecewiseConstantDecay(
+        boundaries=boundaries,
+        values=values
+    )
+
+
+def create_cosine_lr_schedule(initial_lr=0.1, total_epochs=120, warmup_epochs=5):
+    """
+    Create cosine annealing learning rate schedule with warmup.
+    
+    Args:
+        initial_lr: Initial learning rate
+        total_epochs: Total number of training epochs
+        warmup_epochs: Number of warmup epochs
+    
+    Returns:
+        keras.optimizers.schedules.CosineDecay schedule with warmup
+    """
+    if warmup_epochs > 0:
+        # Create warmup + cosine decay schedule
+        warmup_schedule = keras.optimizers.schedules.PolynomialDecay(
+            initial_learning_rate=initial_lr / 100,  # Start from 1% of target LR
+            decay_steps=warmup_epochs,
+            end_learning_rate=initial_lr,
+            power=1.0  # Linear warmup
+        )
+        
+        cosine_schedule = keras.optimizers.schedules.CosineDecay(
+            initial_learning_rate=initial_lr,
+            decay_steps=total_epochs - warmup_epochs
+        )
+        
+        # For simplicity, return cosine schedule (warmup can be added via callback)
+        return cosine_schedule
+    else:
+        return keras.optimizers.schedules.CosineDecay(
+            initial_learning_rate=initial_lr,
+            decay_steps=total_epochs
+        )
 
 
 

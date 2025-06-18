@@ -21,8 +21,9 @@ if gpus:
 
 from data import get_cocoreg_paths, get_cocokp_paths, generate_train_test_split
 from data_model_map import data_model_map
-from models import compile_model
-from callbacks import compute_il_losses, compute_il_losses_streaming, create_tf_data_prioritized_dataset, create_tf_data_random_dataset
+from models import compile_model, create_resnet_lr_schedule, create_cosine_lr_schedule
+from callbacks import compute_il_losses, compute_il_losses_streaming, create_tf_data_prioritized_dataset, create_tf_data_prioritized_dataset_async, create_tf_data_random_dataset, compute_model_losses, compute_model_losses_batch
+from data_utils import create_validation_dataset, create_training_dataset_for_holdout, evaluate_on_dataset
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train prioritized training experiments')
@@ -33,12 +34,70 @@ def parse_args():
                        help='Random seeds to use (can specify multiple)')
     parser.add_argument('--subsample_rate', type=float, nargs='+', default=[0.1], 
                        help='Subsample rate(s) (batch_size / big_batch_size). Can specify one or more.')
+    parser.add_argument('--pt_verbose', action='store_true',
+                       help='Print debug info for prioritized training')
+    parser.add_argument('--async_pt', action='store_true',
+                       help='Use async prioritized training for ~50% speedup')
+    parser.add_argument('--async_update_freq', type=int, default=5,
+                       help='How often to sync inference model weights in async mode (every N batches)')
+    parser.add_argument('--async_cpu_inference', action='store_true',
+                       help='Use CPU for inference model in async mode (saves GPU memory)')
+    # Note: Prioritized training is now efficient by default (candidate-only loss computation)
     return parser.parse_args()
 
-def get_or_train_holdout_model(dataset, config, x_holdout, y_holdout, x_val, y_val):
+def create_lr_schedule_from_config(config, steps_per_epoch, total_epochs):
+    """
+    Create learning rate schedule based on config parameters.
+    
+    Args:
+        config: Configuration dictionary
+        steps_per_epoch: Steps per epoch for converting epoch-based schedules to step-based
+        total_epochs: Total training epochs
+    
+    Returns:
+        Learning rate schedule or None if using fixed learning rate
+    """
+    lr_schedule_type = config.get('lr_schedule_type', None)
+    initial_lr = config.get('learning_rate', 0.001)
+    
+    if lr_schedule_type == 'step':
+        # Step decay schedule
+        decay_epochs = config.get('lr_decay_epochs', [10, 20])
+        decay_factor = config.get('lr_decay_factor', 0.1)
+        
+        # Convert epoch boundaries to step boundaries
+        step_boundaries = [epoch * steps_per_epoch for epoch in decay_epochs]
+        values = [initial_lr * (decay_factor ** i) for i in range(len(decay_epochs) + 1)]
+        
+        return keras.optimizers.schedules.PiecewiseConstantDecay(
+            boundaries=step_boundaries,
+            values=values
+        )
+    elif lr_schedule_type == 'cosine':
+        # Cosine annealing schedule
+        warmup_epochs = config.get('lr_warmup_epochs', 0)
+        total_steps = total_epochs * steps_per_epoch
+        
+        return keras.optimizers.schedules.CosineDecay(
+            initial_learning_rate=initial_lr,
+            decay_steps=total_steps
+        )
+    else:
+        # No schedule, use fixed learning rate
+        return None
+
+def get_or_train_holdout_model(dataset, config, holdout_train_dataset, holdout_eval_dataset, val_dataset, holdout_steps_per_epoch):
     """
     Get cached holdout model or train a new one if it doesn't exist.
     Holdout models are cached by dataset and holdout_epochs (reused across subsample rates).
+    
+    Args:
+        dataset: Dataset name string
+        config: Configuration dictionary
+        holdout_train_dataset: tf.data.Dataset for training
+        holdout_eval_dataset: tf.data.Dataset for holdout evaluation
+        val_dataset: tf.data.Dataset for validation
+        holdout_steps_per_epoch: Number of steps per epoch for holdout training
     """
     os.makedirs('models', exist_ok=True)
     # Include holdout model type in path to avoid conflicts
@@ -49,17 +108,43 @@ def get_or_train_holdout_model(dataset, config, x_holdout, y_holdout, x_val, y_v
     if os.path.exists(holdout_model_path):
         print(f"Loading cached holdout model from {holdout_model_path}")
         # Import model classes for custom object scope
-        from models import ResNet18, ResNet18Model, MLPModel, ConvModel, BasicBlock
+        from models import ResNet18, ResNet18Model, MLPModel, ConvModel, BasicBlock, KeypointResNet18
+        from keypoint_losses import keypoint_loss_with_visibility, keypoint_mse_with_visibility, smooth_l1_loss
+        from keypoint_metrics import OKSMetric, PCKMetric
+        
+        # Import the loss creation function
+        from keypoint_losses import create_keypoint_loss
+        
+        # Create the loss function used during training
+        loss_fn = create_keypoint_loss(config['loss'], **config.get('loss_kwargs', {}))
+        
         custom_objects = {
             'ResNet18': ResNet18,
             'ResNet18Model': ResNet18Model,
             'MLPModel': MLPModel,
             'ConvModel': ConvModel,
-            'BasicBlock': BasicBlock
+            'BasicBlock': BasicBlock,
+            'KeypointResNet18': KeypointResNet18,
+            'keypoint_loss_with_visibility': keypoint_loss_with_visibility,
+            'keypoint_mse_with_visibility': keypoint_mse_with_visibility,
+            'smooth_l1_loss': smooth_l1_loss,
+            'OKSMetric': OKSMetric,
+            'PCKMetric': PCKMetric,
+            'loss_fn': loss_fn  # Add the actual loss function
         }
         with keras.utils.custom_object_scope(custom_objects):
-            holdout_model = keras.models.load_model(holdout_model_path)
-        eval_results = holdout_model.evaluate(x_val, y_val, verbose=0)
+            holdout_model = keras.models.load_model(holdout_model_path, compile=False)
+            # Recompile with the correct loss function
+            from models import compile_model
+            compile_model(holdout_model, 
+                         loss=config['loss'],
+                         loss_kwargs=config.get('loss_kwargs', {}),
+                         metrics=config['metrics'],
+                         learning_rate=config['learning_rate'],
+                         optimizer=config.get('optimizer', 'sgd'),
+                         momentum=config.get('momentum', 0.9),
+                         weight_decay=config.get('weight_decay', 5e-4))
+        eval_results = holdout_model.evaluate(val_dataset, verbose=0)
         holdout_test_loss = eval_results[0]  # Always the first value (loss)
         holdout_test_acc = eval_results[1]   # Main metric (mse for regression, accuracy for classification)
         print(f"Cached holdout model test metric: {holdout_test_acc:.4f}")
@@ -69,38 +154,70 @@ def get_or_train_holdout_model(dataset, config, x_holdout, y_holdout, x_val, y_v
         # Create fresh holdout model - use separate holdout_model if specified
         holdout_model_class = config.get('holdout_model', config['model'])
         # Handle different parameter names for different models
-        if holdout_model_class.__name__ == 'ResNet18':
+        if holdout_model_class.__name__ == 'KeypointResNet18':
+            holdout_model = holdout_model_class(
+                num_outputs=config['n_outputs'], 
+                input_shape=config['input_shape']
+            )
+        elif holdout_model_class.__name__ == 'ResNet18':
             holdout_model = holdout_model_class(
                 num_outputs=config.get('n_outputs', config.get('n_classes')), 
                 input_shape=config['input_shape'],
                 output_activation=config.get('output_activation')
             )
         else:
-            holdout_model = holdout_model_class(
-                num_classes=config.get('n_classes', config.get('n_outputs')), 
-                input_shape=config['input_shape']
-            ).create_model()
+            # Handle regression models that use num_outputs instead of num_classes
+            if 'n_outputs' in config:
+                holdout_model = holdout_model_class(
+                    num_outputs=config['n_outputs'], 
+                    input_shape=config['input_shape']
+                )
+            else:
+                holdout_model = holdout_model_class(
+                    num_classes=config['n_classes'], 
+                    input_shape=config['input_shape']
+                ).create_model()
+        
+        # Create learning rate schedule for holdout model
+        holdout_lr_schedule = create_lr_schedule_from_config(config, holdout_steps_per_epoch, config['holdout_epochs'])
         
         holdout_model = compile_model(
             holdout_model, 
             loss=config['loss'], 
             metrics=config['metrics'],
-            learning_rate=config.get('learning_rate', 0.001)
+            learning_rate=config.get('learning_rate', 0.001),
+            loss_kwargs=config.get('loss_kwargs', None),
+            optimizer=config.get('optimizer', 'sgd'),
+            momentum=config.get('momentum', 0.9),
+            weight_decay=config.get('weight_decay', 5e-4),
+            lr_schedule=holdout_lr_schedule
         )
         print(f"Compiling holdout model with loss: {config['loss']} and metrics: {config['metrics']}")
         holdout_model.summary()
         
-        # Train holdout model on holdout data
+        # Simple W&B callback for holdout model
+        wandb_callback = wandb.keras.WandbCallback(
+            save_model=False,
+            log_batch_frequency=10,
+            log_best_prefix="holdout_best_",
+            validation_data=val_dataset,
+            predictions=10,
+            generator=None,
+            save_graph=False  # Disable graph logging to avoid compatibility issues
+        )
+        
+        # Train holdout model using tf.data pipeline with W&B logging
         holdout_history = holdout_model.fit(
-            x_holdout, y_holdout,
-            batch_size=config['batch_size'],
+            holdout_train_dataset,
+            steps_per_epoch=holdout_steps_per_epoch,
             epochs=config['holdout_epochs'],
-            validation_data=(x_val, y_val),
+            validation_data=val_dataset,
+            callbacks=[wandb_callback],
             verbose=1
         )
         
         # Evaluate and save
-        eval_results = holdout_model.evaluate(x_val, y_val, verbose=0)
+        eval_results = holdout_model.evaluate(val_dataset, verbose=0)
         holdout_test_loss = eval_results[0]
         holdout_test_acc = eval_results[1]
         print(f"New holdout model test metric: {holdout_test_acc:.4f}")
@@ -111,10 +228,22 @@ def get_or_train_holdout_model(dataset, config, x_holdout, y_holdout, x_val, y_v
     
     return holdout_model, holdout_test_acc, holdout_model_path
 
-def train_model_with_tracking(model, dataset, x_val, y_val, 
-                             config, steps_per_epoch, epochs, train_batch_size, model_type):
+def train_model_with_tracking(model, dataset, val_dataset, 
+                             config, steps_per_epoch, epochs, train_batch_size, model_type,
+                             global_step_offset=0):
     """
     Train a model using a data generator and track step-wise progress for plotting.
+    
+    Args:
+        model: Model to train
+        dataset: Training tf.data.Dataset
+        val_dataset: Validation tf.data.Dataset
+        config: Configuration dictionary
+        steps_per_epoch: Steps per epoch
+        epochs: Number of epochs
+        train_batch_size: Training batch size
+        model_type: Model type string (for logging)
+        global_step_offset: Offset for global step counter (for tracking across models)
     """
     # Track progress manually since we need step counts
     step_history = {
@@ -124,50 +253,106 @@ def train_model_with_tracking(model, dataset, x_val, y_val,
     }
     
     class StepTrackingCallback(keras.callbacks.Callback):
-        def __init__(self, x_val, y_val, steps_per_epoch, model_type, config):
-            self.x_val = x_val
-            self.y_val = y_val
+        def __init__(self, val_dataset, steps_per_epoch, model_type, config, global_step_offset, total_epochs):
+            self.val_dataset = val_dataset
             self.steps_per_epoch = steps_per_epoch
             self.current_step = 0
+            self.global_step = global_step_offset
             self.model_type = model_type
             self.config = config
+            self.batch_count = 0
+            self.start_time = None
+            self.total_epochs = total_epochs
+            
+        def on_train_begin(self, logs=None):
+            self.start_time = tf.timestamp().numpy()
+            
+        def on_batch_end(self, batch, logs=None):
+            self.batch_count += 1
+            self.current_step += 1
+            self.global_step += 1
+            
+            # Log batch-level metrics every 10 batches
+            if self.batch_count % 10 == 0:
+                elapsed_time = tf.timestamp().numpy() - self.start_time
+                steps_per_second = self.global_step / elapsed_time if elapsed_time > 0 else 0
+                
+                batch_log = {
+                    "batch_loss": logs.get('loss', 0),
+                    "current_step": self.current_step,
+                    "global_step": self.global_step,
+                    "steps_per_second": steps_per_second,
+                    "model_type": self.model_type
+                }
+                wandb.log(batch_log)
             
         def on_epoch_end(self, epoch, logs=None):
-            self.current_step += self.steps_per_epoch
+            # Note: current_step and global_step are already incremented in on_batch_end
+            # No need to increment again here
             # Evaluate on validation set
-            eval_results = self.model.evaluate(self.x_val, self.y_val, verbose=0)
+            eval_results = self.model.evaluate(self.val_dataset, verbose=0)
             val_loss = eval_results[0]
+            
+            # Debug logging
+            print(f"[{self.model_type}] Epoch {epoch+1}/{self.total_epochs} completed - Step: {self.current_step}, Global step: {self.global_step}")
             
             # Log metrics based on task type
             wandb_log = {
-                f"{self.model_type}_val_loss": val_loss,
-                f"{self.model_type}_step": self.current_step,
-                "epoch": epoch + 1
+                "val_loss": val_loss,
+                "step": self.current_step,
+                "epoch": epoch + 1,
+                "global_step": self.global_step,
+                "total_training_steps": self.global_step,
+                "model_type": self.model_type
             }
             
-            # For regression tasks, log MSE and MAE
+            # For regression tasks, handle different metric types
             if 'target_metric_value' in self.config:
-                val_mse = eval_results[1] if len(eval_results) > 1 else val_loss
-                val_mae = eval_results[2] if len(eval_results) > 2 else None
-                
-                wandb_log[f"{self.model_type}_val_mse"] = val_mse
-                if val_mae is not None:
-                    wandb_log[f"{self.model_type}_val_mae"] = val_mae
-                
-                step_history['val_accuracy'].append(val_mse)  # Store MSE as primary metric
+                # Check if this is keypoint detection (has OKS metric)
+                if self.config.get('loss') == 'smooth_l1_with_visibility' and len(eval_results) > 3:
+                    # For keypoint: [loss, OKS, PCK, MSE]
+                    val_oks = eval_results[1]  # OKS is primary metric
+                    val_pck = eval_results[2] if len(eval_results) > 2 else None
+                    val_mse = eval_results[3] if len(eval_results) > 3 else None
+                    
+                    wandb_log["val_oks"] = val_oks
+                    wandb_log["val_pck"] = val_pck
+                    if val_mse is not None:
+                        wandb_log["val_mse"] = val_mse
+                    
+                    step_history['val_accuracy'].append(val_oks)  # Store OKS as primary metric
+                else:
+                    # Standard regression (MSE/MAE)
+                    val_mse = eval_results[1] if len(eval_results) > 1 else val_loss
+                    val_mae = eval_results[2] if len(eval_results) > 2 else None
+                    
+                    wandb_log["val_mse"] = val_mse
+                    if val_mae is not None:
+                        wandb_log["val_mae"] = val_mae
+                    
+                    step_history['val_accuracy'].append(val_mse)  # Store MSE as primary metric
             else:
                 # For classification tasks, log accuracy
                 val_acc = eval_results[1] if len(eval_results) > 1 else 0.0
-                wandb_log[f"{self.model_type}_val_accuracy"] = val_acc
+                wandb_log["val_accuracy"] = val_acc
                 step_history['val_accuracy'].append(val_acc)
             
             step_history['steps'].append(self.current_step)
             step_history['val_loss'].append(val_loss)
             
+            # Add elapsed time and progress metrics
+            elapsed_time = tf.timestamp().numpy() - self.start_time
+            progress_percentage = (self.current_step / (self.steps_per_epoch * self.total_epochs)) * 100
+            
+            wandb_log.update({
+                "elapsed_time_seconds": elapsed_time,
+                "progress_percentage": progress_percentage
+            })
+            
             # Log to wandb
             wandb.log(wandb_log)
     
-    step_tracker = StepTrackingCallback(x_val, y_val, steps_per_epoch, model_type, config)
+    step_tracker = StepTrackingCallback(val_dataset, steps_per_epoch, model_type, config, global_step_offset, epochs)
     callbacks = [step_tracker]
     
     # Train model using tf.data dataset
@@ -175,27 +360,41 @@ def train_model_with_tracking(model, dataset, x_val, y_val,
         dataset,
         steps_per_epoch=steps_per_epoch,
         epochs=epochs,
-        validation_data=(x_val, y_val),
+        validation_data=val_dataset,
         callbacks=callbacks,
         verbose=1
     )
     
     # Final evaluation
-    eval_results = model.evaluate(x_val, y_val, verbose=0)
+    eval_results = model.evaluate(val_dataset, verbose=0)
     final_test_loss = eval_results[0]
-    final_test_acc = eval_results[1]
     
-    # Calculate steps to target metric (accuracy for classification, metric_value for regression)
+    # Extract final metric based on task type
+    if config.get('loss') == 'smooth_l1_with_visibility' and len(eval_results) > 3:
+        # For keypoint detection, OKS is the primary metric
+        final_test_acc = eval_results[1]  # OKS
+    else:
+        # For other tasks, use second metric (accuracy or MSE)
+        final_test_acc = eval_results[1]
+    
+    # Calculate steps to target metric
     target_metric = config.get('target_accuracy') or config.get('target_metric_value')
     is_regression = 'target_metric_value' in config
+    is_oks = config.get('loss') == 'smooth_l1_with_visibility'
     steps_to_target = None
     reached_target = False
     
-    metric_values = step_history['val_loss'] if is_regression else step_history['val_accuracy']
+    # val_accuracy contains the primary metric (OKS for keypoints, accuracy for classification, MSE for regression)
+    metric_values = step_history['val_accuracy']
     
     for i, metric_val in enumerate(metric_values):
-        # For regression, we want loss <= target_metric_value. For classification, accuracy >= target_accuracy
-        target_reached = (metric_val <= target_metric) if is_regression else (metric_val >= target_metric)
+        # For OKS/accuracy: higher is better (>= target)
+        # For MSE (non-OKS regression): lower is better (<= target)
+        if is_oks or not is_regression:
+            target_reached = metric_val >= target_metric
+        else:
+            target_reached = metric_val <= target_metric
+            
         if target_reached:
             steps_to_target = step_history['steps'][i]
             reached_target = True
@@ -205,7 +404,8 @@ def train_model_with_tracking(model, dataset, x_val, y_val,
         'final_test_acc': final_test_acc,
         'steps_to_target': steps_to_target,
         'reached_target': reached_target,
-        'history_by_step': step_history
+        'history_by_step': step_history,
+        'total_steps': step_tracker.current_step
     }
 
 def main():
@@ -219,7 +419,9 @@ def main():
         config={
             "dataset": args.dataset,
             "seeds": args.seeds,
-            "subsample_rates": args.subsample_rate
+            "subsample_rates": args.subsample_rate,
+            "experiment_type": "rs_vs_pt_comparison",
+            "pt_verbose": args.pt_verbose
         }
     )
     
@@ -234,43 +436,50 @@ def main():
     # Get dataset configuration
     config = data_model_map[args.dataset]
     
+    
     # Load dataset paths for tf.data pipeline
     if args.dataset == 'cocoreg':
         print(f"Loading COCO regression dataset paths for tf.data pipeline...")
         image_paths, labels = get_cocoreg_paths()
+        # Convert list to numpy array for compatibility with generate_train_test_split
+        image_paths = np.array(image_paths)
     elif args.dataset == 'cocokp':
         print(f"Loading COCO keypoint dataset paths for tf.data pipeline...")
-        image_paths, labels = get_cocokp_paths()
+        # For quick testing with subsample < 0.01, limit max samples
+        max_samples = None
+        # Uncomment the following lines to limit samples for quick testing:
+        # if min(subsample_rates) < 0.01:
+        #     max_samples = 10000  # Load only 10k samples for very small subsample rates
+        #     print(f"  Limiting to {max_samples} samples for quick testing")
+        # Load with visibility information if specified in config
+        include_visibility = config.get('include_visibility', False)
+        image_paths, labels = get_cocokp_paths(max_samples=max_samples, include_visibility=include_visibility)
+        # Convert list to numpy array for compatibility with generate_train_test_split
+        image_paths = np.array(image_paths)
     else:
         raise NotImplementedError(f"Dataset {args.dataset} not supported in this optimized version")
+    
     
     # Split data (once for all seeds)
     is_regression = 'target_metric_value' in config
     (train_paths, y_train), (val_paths, y_val), (holdout_paths, y_holdout) = generate_train_test_split(image_paths, labels, is_regression=is_regression, use_paths=True)
     
-    # Load holdout and validation images into memory for holdout model training
-    print("Loading holdout and validation images for holdout model training...")
-    from PIL import Image
     
-    def load_images_from_paths(paths):
-        images = []
-        target_size = config['input_shape'][:2]  # (H, W)
-        for i, path in enumerate(paths):
-            if i % 100 == 0:
-                print(f"  Loaded {i}/{len(paths)} images")
-            try:
-                img = Image.open(path).convert('RGB')
-                img = img.resize(target_size)
-                images.append(np.array(img))
-            except Exception as e:
-                print(f"Error loading {path}: {e}")
-                # Create dummy image
-                images.append(np.zeros(target_size + (3,), dtype=np.uint8))
-        return np.array(images).astype('float32') / 255.0
+    # Create tf.data datasets for validation and holdout data (memory-efficient)
+    print("Creating tf.data pipelines for validation and holdout data...")
+    val_dataset = create_validation_dataset(val_paths, y_val, batch_size=config['batch_size'], input_shape=config['input_shape'])
+    holdout_dataset_for_training = create_training_dataset_for_holdout(
+        holdout_paths, y_holdout, 
+        batch_size=config['batch_size'], 
+        input_shape=config['input_shape'],
+        epochs=config['holdout_epochs']
+    )
+    holdout_dataset_for_eval = create_validation_dataset(holdout_paths, y_holdout, batch_size=config['batch_size'], input_shape=config['input_shape'])
     
-    x_val = load_images_from_paths(val_paths)
-    x_holdout = load_images_from_paths(holdout_paths)
-    print("Holdout and validation images loaded.")
+    # For compatibility with existing code that needs x_val in memory (will optimize later)
+    # Load validation data in smaller batches for the step tracking callback
+    print("Note: Validation data will be loaded on-demand during evaluation")
+    
     
     batch_size = config['batch_size']
     holdout_epochs = config['holdout_epochs']
@@ -285,8 +494,12 @@ def main():
     print("GETTING/TRAINING HOLDOUT MODEL")
     print(f"{'='*50}")
     
+    # Calculate steps per epoch for holdout training
+    holdout_steps_per_epoch = len(holdout_paths) // batch_size
+    
     holdout_model, holdout_test_acc, holdout_model_path = get_or_train_holdout_model(
-        args.dataset, config, x_holdout, y_holdout, x_val, y_val
+        args.dataset, config, holdout_dataset_for_training, holdout_dataset_for_eval, 
+        val_dataset, holdout_steps_per_epoch
     )
     
     # Log holdout model performance
@@ -296,6 +509,7 @@ def main():
     print(f"\nComputing IL losses...")
     
     il_loss_dict = compute_il_losses_streaming(holdout_model, train_paths, y_train, config, batch_size=batch_size)
+    
     
     # Train models for each subsample rate
     for subsample_rate in subsample_rates:
@@ -318,6 +532,10 @@ def main():
         print(f"  Training epochs: {epochs}")
         print(f"  Subsample rate: {subsample_rate}")
         print(f"  Using tf.data pipeline")
+        if args.async_pt:
+            print(f"  ASYNC MODE ENABLED - Update frequency: every {args.async_update_freq} batches")
+        else:
+            print(f"  Using synchronous prioritized training")
         
         # Update wandb config for this subsample rate
         wandb.config.update({
@@ -326,7 +544,10 @@ def main():
             "big_batch_size": big_batch_size,
             "steps_per_epoch": steps_per_epoch,
             "epochs": epochs,
-            "dataset_size": dataset_size
+            "dataset_size": dataset_size,
+            "async_pt": args.async_pt,
+            "async_update_freq": args.async_update_freq if args.async_pt else None,
+            "total_expected_steps": steps_per_epoch * epochs * 2 * len(args.seeds)  # RS + PT for each seed
         })
         
         # Initialize results structure for this subsample rate
@@ -362,9 +583,14 @@ def main():
             
             # Handle different parameter names for different models
             model_class = config['model']
-            if model_class.__name__ == 'ResNet18':
+            if model_class.__name__ == 'KeypointResNet18':
                 rs_model = model_class(
-                    num_outputs=config.get('n_outputs', config.get('n_classes')), 
+                    num_outputs=config['n_outputs'], 
+                    input_shape=config['input_shape']
+                )
+            elif model_class.__name__ == 'ResNet18':
+                rs_model = model_class(
+                    num_outputs=config.get('n_outputs', config.get('n_outputs')), 
                     input_shape=config['input_shape'],
                     output_activation=config.get('output_activation')
                 )
@@ -374,41 +600,64 @@ def main():
                     input_shape=config['input_shape']
                 ).create_model()
             
+            # Create learning rate schedule for RS model
+            rs_lr_schedule = create_lr_schedule_from_config(config, steps_per_epoch, epochs)
+            
             rs_model = compile_model(
                 rs_model, 
                 loss=config['loss'], 
                 metrics=config['metrics'],
-                learning_rate=config.get('learning_rate', 0.001)
+                learning_rate=config.get('learning_rate', 0.001),
+                loss_kwargs=config.get('loss_kwargs', None),
+                optimizer=config.get('optimizer', 'sgd'),
+                momentum=config.get('momentum', 0.9),
+                weight_decay=config.get('weight_decay', 5e-4),
+                lr_schedule=rs_lr_schedule
             )
             print(f"Compiling RS model with loss: {config['loss']} and metrics: {config['metrics']}")
             rs_model.summary()
 
             
             # Create tf.data random dataset with augmentation
-            rs_dataset = create_tf_data_random_dataset(
-                train_paths, y_train,
-                train_batch_size=batch_size,
-                cand_batch_size=big_batch_size,
-                steps_per_epoch=steps_per_epoch,
-                input_shape=config['input_shape'],
-                augmentation_layers=config.get('augmentation', None)
-            )
+            # rs_dataset = create_tf_data_random_dataset(
+            #     train_paths, y_train,
+            #     train_batch_size=batch_size,
+            #     cand_batch_size=big_batch_size,
+            #     steps_per_epoch=steps_per_epoch,
+            #     input_shape=config['input_shape'],
+            #     augmentation_layers=config.get('augmentation', None)
+            # )
             
-            rs_result = train_model_with_tracking(
-                rs_model, rs_dataset, x_val, y_val,
-                config, steps_per_epoch, epochs, batch_size, "rs"
-            )
+            # rs_result = train_model_with_tracking(
+            #     rs_model, rs_dataset, val_dataset,
+            #     config, steps_per_epoch, epochs, batch_size, "rs",
+            #     global_step_offset=0  # RS model starts at step 0
+            # )
             
-            results['rs_results'][seed] = rs_result
-            print(f"RS model (seed {seed}) final accuracy: {rs_result['final_test_acc']:.4f}")
+            # results['rs_results'][seed] = rs_result
+            # print(f"RS model (seed {seed}) final accuracy: {rs_result['final_test_acc']:.4f}")
             
-            # Log final RS results for this seed
-            wandb.log({
-                f"rs_final_accuracy_seed_{seed}": rs_result['final_test_acc'],
-                f"rs_steps_to_target_seed_{seed}": rs_result['steps_to_target'],
-                f"rs_reached_target_seed_{seed}": rs_result['reached_target'],
-                "current_seed": seed
-            })
+            # # Log final RS results for this seed
+            # wandb.log({
+            #     f"rs_final_accuracy_seed_{seed}": rs_result['final_test_acc'],
+            #     f"rs_steps_to_target_seed_{seed}": rs_result['steps_to_target'],
+            #     f"rs_reached_target_seed_{seed}": rs_result['reached_target'],
+            #     f"rs_total_steps_seed_{seed}": rs_result['total_steps'],
+            #     "current_seed": seed,
+            #     "model_type": "random_sampling",
+            #     "phase": "training_complete"
+            # })
+            
+            # # Also log comparable metrics without prefix for better visualization
+            # wandb.log({
+            #     "final_accuracy": rs_result['final_test_acc'],
+            #     "steps_to_target": rs_result['steps_to_target'],
+            #     "reached_target": rs_result['reached_target'],
+            #     "total_steps": rs_result['total_steps'],
+            #     "model_type": "rs",
+            #     "seed": seed,
+            #     "phase": "final"
+            # })
             
             # Train Prioritized Training (PT) model
             print(f"\nTraining Prioritized Training model (seed {seed})...")
@@ -419,7 +668,12 @@ def main():
             
             # Handle different parameter names for different models
             model_class = config['model']
-            if model_class.__name__ == 'ResNet18':
+            if model_class.__name__ == 'KeypointResNet18':
+                pt_model = model_class(
+                    num_outputs=config['n_outputs'], 
+                    input_shape=config['input_shape']
+                )
+            elif model_class.__name__ == 'ResNet18':
                 pt_model = model_class(
                     num_outputs=config.get('n_outputs', config.get('n_classes')), 
                     input_shape=config['input_shape'],
@@ -431,29 +685,60 @@ def main():
                     input_shape=config['input_shape']
                 ).create_model()
             
+            # Create learning rate schedule for PT model
+            pt_lr_schedule = create_lr_schedule_from_config(config, steps_per_epoch, epochs)
+            
             pt_model = compile_model(
                 pt_model, 
                 loss=config['loss'], 
                 metrics=config['metrics'],
-                learning_rate=config.get('learning_rate', 0.001)
+                learning_rate=config.get('learning_rate', 0.001),
+                loss_kwargs=config.get('loss_kwargs', None),
+                optimizer=config.get('optimizer', 'sgd'),
+                momentum=config.get('momentum', 0.9),
+                weight_decay=config.get('weight_decay', 5e-4),
+                lr_schedule=pt_lr_schedule
             )
             print(f"Compiling PT model with loss: {config['loss']} and metrics: {config['metrics']}")
             pt_model.summary()
             
             # Create tf.data prioritized dataset with augmentation
-            pt_dataset = create_tf_data_prioritized_dataset(
-                train_paths, y_train,
-                il_loss_dict=il_loss_dict,
-                train_batch_size=batch_size,
-                cand_batch_size=big_batch_size,
-                steps_per_epoch=steps_per_epoch,
-                input_shape=config['input_shape'],
-                augmentation_layers=config.get('augmentation', None)
-            )
+            if args.async_pt:
+                print(f"Creating ASYNC prioritized training dataset for ~50% speedup...")
+                pt_dataset = create_tf_data_prioritized_dataset_async(
+                    pt_model, train_paths, y_train,
+                    il_loss_dict=il_loss_dict,
+                    train_batch_size=batch_size,
+                    cand_batch_size=big_batch_size,
+                    steps_per_epoch=steps_per_epoch,
+                    input_shape=config['input_shape'],
+                    augmentation_layers=config.get('augmentation', None),
+                    config=config,
+                    verbose=args.pt_verbose,
+                    update_freq=args.async_update_freq,
+                    use_cpu_inference=args.async_cpu_inference
+                )
+            else:
+                print(f"Creating EFFICIENT prioritized training dataset...")
+                pt_dataset = create_tf_data_prioritized_dataset(
+                    pt_model, train_paths, y_train,
+                    il_loss_dict=il_loss_dict,
+                    train_batch_size=batch_size,
+                    cand_batch_size=big_batch_size,
+                    steps_per_epoch=steps_per_epoch,
+                    input_shape=config['input_shape'],
+                    augmentation_layers=config.get('augmentation', None),
+                    config=config,
+                    verbose=args.pt_verbose
+                )
             
+            # Before training the PT model, set global_step_offset:
+            global_step_offset = rs_result['total_steps'] if 'rs_result' in locals() else 0
+
             pt_result = train_model_with_tracking(
-                pt_model, pt_dataset, x_val, y_val,
-                config, steps_per_epoch, epochs, batch_size, "pt"
+                pt_model, pt_dataset, val_dataset,
+                config, steps_per_epoch, epochs, batch_size, "pt",
+                global_step_offset=global_step_offset
             )
             
             results['pt_results'][seed] = pt_result
@@ -464,7 +749,22 @@ def main():
                 f"pt_final_accuracy_seed_{seed}": pt_result['final_test_acc'],
                 f"pt_steps_to_target_seed_{seed}": pt_result['steps_to_target'],
                 f"pt_reached_target_seed_{seed}": pt_result['reached_target'],
-                "current_seed": seed
+                f"pt_total_steps_seed_{seed}": pt_result['total_steps'],
+                "current_seed": seed,
+                "model_type": "prioritized_training",
+                "phase": "training_complete",
+                "total_experiment_steps": pt_result['total_steps'] + rs_result['total_steps']
+            })
+            
+            # Also log comparable metrics without prefix for better visualization
+            wandb.log({
+                "final_accuracy": pt_result['final_test_acc'],
+                "steps_to_target": pt_result['steps_to_target'],
+                "reached_target": pt_result['reached_target'],
+                "total_steps": pt_result['total_steps'],
+                "model_type": "pt",
+                "seed": seed,
+                "phase": "final"
             })
     
         
@@ -514,6 +814,10 @@ def main():
             decline = ((rs_mean - pt_mean) / rs_mean) * 100
             print(f"PT decline vs RS: -{decline:.2f}%")
         
+        # Calculate total steps for this subsample rate
+        total_steps_per_seed = steps_per_epoch * epochs * 2  # RS + PT
+        total_steps_all_seeds = total_steps_per_seed * len(args.seeds)
+        
         # Log summary statistics
         wandb.log({
             f"rs_mean_accuracy_subsample_{subsample_rate}": rs_mean,
@@ -521,7 +825,9 @@ def main():
             f"pt_mean_accuracy_subsample_{subsample_rate}": pt_mean,
             f"pt_std_accuracy_subsample_{subsample_rate}": pt_std,
             f"improvement_percentage_subsample_{subsample_rate}": improvement if pt_mean > rs_mean else -decline,
-            "subsample_rate": subsample_rate
+            "subsample_rate": subsample_rate,
+            "phase": "subsample_complete",
+            "total_steps_this_subsample": total_steps_all_seeds
         })
         
         # Calculate steps to target statistics

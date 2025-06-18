@@ -402,42 +402,57 @@ def get_cocokp(max_samples=None):
     return images, labels
 
 
-def get_cocokp_paths(max_samples=None):
+def get_cocokp_paths(max_samples=None, include_visibility=False, use_cache=True):
     """
     Load COCO2017 keypoint dataset paths and labels for efficient tf.data loading.
     
     Args:
         max_samples: int, maximum number of samples to load (for testing)
+        include_visibility: bool, if True returns labels with visibility (N, 51), else coordinates only (N, 34)
+        use_cache: bool, if True uses cached annotations for faster loading
     
     Returns:
         image_paths: list of shape (N,) - image file paths
-        labels: np.ndarray of shape (N, 34) - keypoint regression targets (17 keypoints * 2 coords)
+        labels: np.ndarray of shape (N, 34) or (N, 51) - keypoint targets with optional visibility
     """
     import json
+    from coco_cache import COCOCache
     
     base_dir = os.path.join('datasets', 'coco2017')
     
-    # Load keypoint annotations
-    train_kp_path = os.path.join(base_dir, 'annotations', 'person_keypoints_train2017.json')
-    val_kp_path = os.path.join(base_dir, 'annotations', 'person_keypoints_val2017.json')
-    
-    if not os.path.exists(train_kp_path) or not os.path.exists(val_kp_path):
-        raise FileNotFoundError(f"COCO keypoint annotations not found in {base_dir}/annotations/")
-    
-    with open(train_kp_path, 'r') as f:
-        train_data = json.load(f)
-    with open(val_kp_path, 'r') as f:
-        val_data = json.load(f)
-    
-    # Combine all annotations
-    all_annotations = train_data['annotations'] + val_data['annotations']
-    
-    # Create image info mapping (combine train and val images)
-    image_info = {}
-    for img in train_data['images']:
-        image_info[img['id']] = img
-    for img in val_data['images']:
-        image_info[img['id']] = img
+    if use_cache:
+        # Use cached annotations and image index
+        cache = COCOCache(base_dir)
+        ann_data = cache.load_cached_annotations()
+        image_index = cache.build_image_path_index()
+        
+        all_annotations = ann_data['annotations']
+        image_info = ann_data['image_info']
+        
+        print(f"Using cached data: {len(all_annotations)} annotations, {len(image_info)} images")
+    else:
+        # Original implementation for compatibility
+        # Load keypoint annotations
+        train_kp_path = os.path.join(base_dir, 'annotations', 'person_keypoints_train2017.json')
+        val_kp_path = os.path.join(base_dir, 'annotations', 'person_keypoints_val2017.json')
+        
+        if not os.path.exists(train_kp_path) or not os.path.exists(val_kp_path):
+            raise FileNotFoundError(f"COCO keypoint annotations not found in {base_dir}/annotations/")
+        
+        with open(train_kp_path, 'r') as f:
+            train_data = json.load(f)
+        with open(val_kp_path, 'r') as f:
+            val_data = json.load(f)
+        
+        # Combine all annotations
+        all_annotations = train_data['annotations'] + val_data['annotations']
+        
+        # Create image info mapping (combine train and val images)
+        image_info = {}
+        for img in train_data['images']:
+            image_info[img['id']] = img
+        for img in val_data['images']:
+            image_info[img['id']] = img
     
     image_paths = []
     labels = []
@@ -462,39 +477,68 @@ def get_cocokp_paths(max_samples=None):
             continue
             
         img_info = image_info[image_id]
-        img_filename = img_info['file_name']
         
-        # Determine split and create full path
-        if 'train2017' in train_kp_path and any(img['id'] == image_id for img in train_data['images']):
-            img_split = 'train2017'
+        if use_cache:
+            # Use cached image path and validation
+            if image_id not in image_index or not image_index[image_id]['exists']:
+                continue
+            img_path = image_index[image_id]['path']
+            orig_w, orig_h = image_index[image_id]['width'], image_index[image_id]['height']
         else:
-            img_split = 'val2017'
+            # Original path construction
+            img_filename = img_info['file_name']
             
-        img_path = os.path.join(base_dir, img_split, img_filename)
-        
-        if not os.path.exists(img_path):
-            continue
+            # Determine split and create full path
+            if 'train2017' in train_kp_path and any(img['id'] == image_id for img in train_data['images']):
+                img_split = 'train2017'
+            else:
+                img_split = 'val2017'
+                
+            img_path = os.path.join(base_dir, img_split, img_filename)
             
-        # Extract and normalize keypoints (x, y coordinates only, ignore visibility)
-        orig_w, orig_h = img_info['width'], img_info['height']
+            if not os.path.exists(img_path):
+                continue
+                
+            orig_w, orig_h = img_info['width'], img_info['height']
+            
+        # Extract and normalize keypoints
         kp_coords = []
+        visibility_flags = []
+        has_visible_kp = False
+        
         for j in range(0, len(keypoints), 3):
             x, y, v = keypoints[j], keypoints[j+1], keypoints[j+2]
-            # Normalize coordinates to [0, 1]
+            # Normalize coordinates to [0, 1] range
+            # This matches the coordinate space the model expects
             norm_x = (x / orig_w) if orig_w > 0 else 0.0
             norm_y = (y / orig_h) if orig_h > 0 else 0.0
             kp_coords.extend([norm_x, norm_y])
+            visibility_flags.append(float(v))
+            
+            # Check if we have at least one visible keypoint
+            if v > 0 and (norm_x > 0 or norm_y > 0):
+                has_visible_kp = True
         
-        # Only include if we have valid keypoints (not all zeros)
-        if any(coord > 0 for coord in kp_coords):
+        # Only include if we have at least one visible keypoint
+        if has_visible_kp:
             image_paths.append(img_path)
-            labels.append(kp_coords)
+            if include_visibility:
+                # Concatenate coordinates and visibility: [x1,y1,...,x17,y17,v1,...,v17]
+                labels.append(kp_coords + visibility_flags)
+            else:
+                labels.append(kp_coords)
     
-    labels = np.array(labels)  # Shape: (N, 34) for 17 keypoints * 2 coords
+    labels = np.array(labels)  # Shape: (N, 34) or (N, 51) depending on include_visibility
     
     print(f"Loaded {len(image_paths)} COCO keypoint image paths")
     print(f"Label shape: {labels.shape}")
-    print(f"Keypoint statistics - min: {labels.min():.4f}, max: {labels.max():.4f}, mean: {labels.mean():.4f}")
+    if include_visibility:
+        coord_stats = labels[:, :34]
+        vis_stats = labels[:, 34:]
+        print(f"Coordinate statistics - min: {coord_stats.min():.4f}, max: {coord_stats.max():.4f}, mean: {coord_stats.mean():.4f}")
+        print(f"Visibility statistics - min: {vis_stats.min():.0f}, max: {vis_stats.max():.0f}, mean: {vis_stats.mean():.2f}")
+    else:
+        print(f"Keypoint statistics - min: {labels.min():.4f}, max: {labels.max():.4f}, mean: {labels.mean():.4f}")
     
     return image_paths, labels
 

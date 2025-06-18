@@ -1,3 +1,7 @@
+tensorflow>=2.13.0
+wandb>=0.15.0
+matplotlib>=3.5.0
+seaborn>=0.12.0
 absl-py==2.3.0
 apturl==0.5.2
 astunparse==1.6.3

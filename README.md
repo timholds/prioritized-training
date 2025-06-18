@@ -33,7 +33,8 @@ Even though prioritized training is aimed at a scenario where data is plentiful 
     - ResNet-18
 - [ ] COCO Joint keypoint 
     - 330k images at 640x480 with 34 classes (regression labels are joint keypoints)
-    - ResNet-18 
+    - ResNet-18
+    - **Note**: Keypoint regression requires special augmentation handling. Standard image augmentations like horizontal flips must also transform the keypoint coordinates and swap left/right keypoint pairs. Currently, augmentation is disabled for this dataset to avoid incorrect training. 
 - [ ] MPI-INF-3DHP dataset 
     - pose dataset 1.3M frames 
 - [ ] AffectNet 
